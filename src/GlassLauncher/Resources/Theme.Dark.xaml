@@ -1,0 +1,112 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- 暗色（对应系统 设置 → 个性化 → 颜色 → 应用模式 = 深色） -->
+
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#F5F5F7" />
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#A1A1A6" />
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="#6E6E73" />
+
+    <!--
+        玻璃分层（自下而上）：
+          背景模糊（DWM）→ WindowSheen（整体受光）→ PanelSurface（内容面板）
+          → PanelInnerShadow（面板顶部内阴影）→ 边缘折射 WindowEdge / PanelEdge → 顶部镜面高光 TopSpecular
+        暗色下“受光”改为极低透明白，底部压暗更明显，否则整窗会糊成一片灰。
+    -->
+
+    <SolidColorBrush x:Key="GlassWashBrush" Color="Transparent" />
+
+    <!-- 暗色下白底板保留（mac 暗色启动台的图标同样是白底），只把边压暗 -->
+    <SolidColorBrush x:Key="IconPlateBrush" Color="#E8FFFFFF" />
+    <SolidColorBrush x:Key="IconPlateBorderBrush" Color="#33000000" />
+
+    <SolidColorBrush x:Key="PillSelectedBrush" Color="#3DFFFFFF" />
+
+    <!-- 顶部搜索栏：暗色下比背景更亮一档的胶囊（mac 暗色启动台的做法） -->
+    <SolidColorBrush x:Key="SearchSurfaceBrush" Color="#33FFFFFF" />
+    <SolidColorBrush x:Key="SearchBorderBrush" Color="#29FFFFFF" />
+    <SolidColorBrush x:Key="SearchGlyphBrush" Color="#99FFFFFF" />
+
+    <!-- 通透版：暗色下靠“压暗”而不是“刷白”，整层黑灰只保留 20%~30% -->
+    <LinearGradientBrush x:Key="WindowSheenBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#2E232529" Offset="0" />
+        <GradientStop Color="#381E2024" Offset="0.45" />
+        <GradientStop Color="#42191B1E" Offset="1" />
+    </LinearGradientBrush>
+
+    <LinearGradientBrush x:Key="WindowEdgeBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#4DFFFFFF" Offset="0" />
+        <GradientStop Color="#26FFFFFF" Offset="0.22" />
+        <GradientStop Color="#14FFFFFF" Offset="0.55" />
+        <GradientStop Color="#59000000" Offset="0.82" />
+        <GradientStop Color="#8C000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <LinearGradientBrush x:Key="TopSpecularBrush" StartPoint="0,0" EndPoint="1,0">
+        <GradientStop Color="#00FFFFFF" Offset="0" />
+        <GradientStop Color="#3DFFFFFF" Offset="0.12" />
+        <GradientStop Color="#70FFFFFF" Offset="0.5" />
+        <GradientStop Color="#3DFFFFFF" Offset="0.88" />
+        <GradientStop Color="#00FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+
+    <LinearGradientBrush x:Key="PanelSurfaceBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#0FFFFFFF" Offset="0" />
+        <GradientStop Color="#141A1C20" Offset="0.14" />
+        <GradientStop Color="#17181A1E" Offset="0.6" />
+        <GradientStop Color="#1A16181B" Offset="1" />
+    </LinearGradientBrush>
+
+    <LinearGradientBrush x:Key="PanelEdgeBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#59FFFFFF" Offset="0" />
+        <GradientStop Color="#1FFFFFFF" Offset="0.45" />
+        <GradientStop Color="#99000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <LinearGradientBrush x:Key="PanelInnerShadowBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#4D000000" Offset="0" />
+        <GradientStop Color="#1A000000" Offset="0.55" />
+        <GradientStop Color="#00000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <SolidColorBrush x:Key="WindowInnerLineBrush" Color="#1FFFFFFF" />
+
+    <LinearGradientBrush x:Key="HeaderDividerBrush" StartPoint="0,0" EndPoint="1,0">
+        <GradientStop Color="#00FFFFFF" Offset="0" />
+        <GradientStop Color="#1FFFFFFF" Offset="0.16" />
+        <GradientStop Color="#1FFFFFFF" Offset="0.84" />
+        <GradientStop Color="#00FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 兼容旧键 -->
+    <SolidColorBrush x:Key="GlassPanelBrush" Color="#26FFFFFF" />
+    <SolidColorBrush x:Key="GlassBorderBrush" Color="#26FFFFFF" />
+    <SolidColorBrush x:Key="GlassInnerShadowBrush" Color="#33000000" />
+
+    <!-- 暗色需要比亮色更实一点，否则浅色文字压在亮壁纸上读不出来 -->
+    <Color x:Key="AcrylicTint">#66101215</Color>
+
+    <!-- 条目卡片：暗色下用白色低透明度，靠更亮的描边分层 -->
+    <SolidColorBrush x:Key="ItemTileBrush" Color="#1FFFFFFF" />
+    <SolidColorBrush x:Key="ItemTileBorderBrush" Color="#2EFFFFFF" />
+
+    <LinearGradientBrush x:Key="ItemTileHoverBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#38FFFFFF" Offset="0" />
+        <GradientStop Color="#26FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+    <SolidColorBrush x:Key="ItemHoverBorderBrush" Color="#4DFFFFFF" />
+    <SolidColorBrush x:Key="ItemInitialBrush" Color="#B8B8BE" />
+
+    <!-- 右键菜单表面（需要接近不透明，否则菜单文字会透到壁纸上） -->
+    <SolidColorBrush x:Key="MenuSurfaceBrush" Color="#F22C2C30" />
+
+    <SolidColorBrush x:Key="MenuSeparatorBrush" Color="#26FFFFFF" />
+
+    <SolidColorBrush x:Key="ScrollThumbBrush" Color="#59FFFFFF" />
+
+    <!-- 失效角标 -->
+    <SolidColorBrush x:Key="WarningBrush" Color="#FF9F0A" />
+
+    <SolidColorBrush x:Key="WarningTextBrush" Color="#FF8A80" />
+
+</ResourceDictionary>

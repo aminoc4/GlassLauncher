@@ -1,0 +1,191 @@
+<chrome:GlassWindow x:Class="GlassLauncher.Dialogs.SettingsDialog"
+                    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:chrome="clr-namespace:GlassLauncher.Chrome"
+                    Title="设置"
+                    Width="440"
+                    Height="600"
+                    ResizeMode="NoResize"
+                    ShowInTaskbar="False"
+                    WindowStartupLocation="CenterOwner"
+                    FontFamily="{StaticResource UiFont}"
+                    CaptionHeight="0"
+                    CornerRadius="14"
+                    Backdrop="Acrylic"
+                    TintColor="{DynamicResource AcrylicTint}">
+
+    <!-- 与 PromptDialog 同一套玻璃分层：受光层 → 内容 → 边缘折射 → 顶部镜面高光 -->
+    <Grid>
+        <Border CornerRadius="14"
+                Background="{DynamicResource WindowSheenBrush}"
+                IsHitTestVisible="False" />
+
+        <Grid Margin="24,16,24,18">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- 标题行兼作拖动把手 -->
+            <Border Grid.Row="0"
+                    Background="Transparent"
+                    MouseLeftButtonDown="OnHeaderMouseDown">
+                <TextBlock Text="设置"
+                           FontSize="13"
+                           FontWeight="SemiBold"
+                           Foreground="{StaticResource TextPrimaryBrush}" />
+            </Border>
+
+            <ScrollViewer Grid.Row="1"
+                          Margin="0,4,0,0"
+                          VerticalScrollBarVisibility="Auto">
+                <StackPanel>
+
+                    <!-- ── 外观 ── -->
+                    <TextBlock Text="外观"
+                               FontSize="11"
+                               FontWeight="SemiBold"
+                               Margin="0,8,0,6"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <TextBlock Text="主题"
+                               FontSize="12.5"
+                               Foreground="{StaticResource TextPrimaryBrush}" />
+                    <StackPanel Orientation="Horizontal" Margin="0,7,0,0">
+                        <RadioButton x:Name="ThemeFollow" Content="跟随系统" GroupName="theme" Margin="0,0,18,0"
+                                     Checked="OnThemeChanged" Foreground="{StaticResource TextPrimaryBrush}" />
+                        <RadioButton x:Name="ThemeLight" Content="浅色" GroupName="theme" Margin="0,0,18,0"
+                                     Checked="OnThemeChanged" Foreground="{StaticResource TextPrimaryBrush}" />
+                        <RadioButton x:Name="ThemeDark" Content="深色" GroupName="theme"
+                                     Checked="OnThemeChanged" Foreground="{StaticResource TextPrimaryBrush}" />
+                    </StackPanel>
+
+                    <Grid Margin="0,16,0,0">
+                        <TextBlock Text="背景模糊半径"
+                                   FontSize="12.5"
+                                   Foreground="{StaticResource TextPrimaryBrush}" />
+                        <TextBlock x:Name="BlurValue"
+                                   Text="12"
+                                   FontSize="12.5"
+                                   HorizontalAlignment="Right"
+                                   Foreground="{StaticResource TextSecondaryBrush}" />
+                    </Grid>
+                    <Slider x:Name="BlurSlider"
+                            Minimum="4"
+                            Maximum="28"
+                            IsSnapToTickEnabled="True"
+                            TickFrequency="1"
+                            Margin="0,8,0,0"
+                            ValueChanged="OnBlurChanged" />
+                    <TextBlock Text="背景实时模糊的浓度，12 是实测最接近 mac 的值"
+                               FontSize="11"
+                               Margin="0,4,0,0"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <!-- ── 行为 ── -->
+                    <TextBlock Text="行为"
+                               FontSize="11"
+                               FontWeight="SemiBold"
+                               Margin="0,20,0,6"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <CheckBox x:Name="TopmostCheck" Content="窗口置顶（盖在其他窗口上面）"
+                              Margin="0,2,0,0" Checked="OnTopmostChanged" Unchecked="OnTopmostChanged"
+                              Foreground="{StaticResource TextPrimaryBrush}" />
+                    <CheckBox x:Name="BrokenCheck" Content="启动时检查失效条目（打感叹角标）"
+                              Margin="0,8,0,0" Checked="OnBrokenCheckChanged" Unchecked="OnBrokenCheckChanged"
+                              Foreground="{StaticResource TextPrimaryBrush}" />
+
+                    <!-- ── 托盘与快捷键 ── -->
+                    <TextBlock Text="托盘与快捷键"
+                               FontSize="11"
+                               FontWeight="SemiBold"
+                               Margin="0,20,0,6"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <Grid Margin="0,2,0,0">
+                        <TextBlock Text="显示 / 隐藏快捷键"
+                                   FontSize="12.5"
+                                   VerticalAlignment="Center"
+                                   Foreground="{StaticResource TextPrimaryBrush}" />
+                        <TextBox x:Name="HotkeyBox"
+                                 Width="140"
+                                 Height="26"
+                                 HorizontalAlignment="Right"
+                                 IsReadOnly="True"
+                                 IsReadOnlyCaretVisible="False"
+                                 Cursor="Hand"
+                                 TextAlignment="Center"
+                                 FontSize="12"
+                                 Background="{DynamicResource MenuSurfaceBrush}"
+                                 BorderBrush="{DynamicResource GlassBorderBrush}"
+                                 Foreground="{StaticResource TextPrimaryBrush}"
+                                 CaretBrush="{StaticResource TextPrimaryBrush}"
+                                 PreviewKeyDown="OnHotkeyKeyDown"
+                                 ToolTip="点击后按下新的组合键，立即生效" />
+                    </Grid>
+                    <TextBlock Text="点击右侧输入框，然后按下组合键。Ctrl / Alt / Shift / Win 至少要一个（F1~F12 可单独使用）"
+                               FontSize="11"
+                               TextWrapping="Wrap"
+                               Margin="0,6,0,0"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <CheckBox x:Name="AutostartCheck" Content="开机自动启动（启动后显示在托盘）"
+                              Margin="0,10,0,0" Checked="OnAutostartChanged" Unchecked="OnAutostartChanged"
+                              Foreground="{StaticResource TextPrimaryBrush}" />
+                    <TextBlock Text="平时收在系统托盘：左键点托盘图标或按快捷键唤出；右键托盘图标可退出"
+                               FontSize="11"
+                               TextWrapping="Wrap"
+                               Margin="0,6,0,0"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <!-- ── 数据 ── -->
+                    <TextBlock Text="数据"
+                               FontSize="11"
+                               FontWeight="SemiBold"
+                               Margin="0,20,0,6"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+
+                    <StackPanel Orientation="Horizontal">
+                        <Button Content="打开数据文件夹"
+                                Style="{StaticResource DialogButton}"
+                                Click="OnOpenDataFolder" />
+                        <Button Content="清除图标缓存"
+                                Style="{StaticResource DialogButton}"
+                                Margin="8,0,0,0"
+                                Click="OnClearIconCache" />
+                    </StackPanel>
+                    <TextBlock Text="数据文件：%LocalAppData%\GlassLauncher\launcher-data.json"
+                               FontSize="11"
+                               TextWrapping="Wrap"
+                               Margin="0,8,0,0"
+                               Foreground="{StaticResource TextTertiaryBrush}" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- 底部：版本 + 完成 -->
+            <Grid Grid.Row="2" Margin="0,14,0,0">
+                <TextBlock x:Name="VersionText"
+                           VerticalAlignment="Center"
+                           FontSize="11.5"
+                           Foreground="{StaticResource TextTertiaryBrush}" />
+                <Button Content="完成"
+                        Style="{StaticResource PrimaryDialogButton}"
+                        HorizontalAlignment="Right"
+                        Click="OnDone" />
+            </Grid>
+        </Grid>
+
+        <Border CornerRadius="14"
+                BorderThickness="1"
+                BorderBrush="{DynamicResource WindowEdgeBrush}"
+                IsHitTestVisible="False" />
+
+        <Border Height="1"
+                VerticalAlignment="Top"
+                Margin="18,0,18,0"
+                Background="{DynamicResource TopSpecularBrush}"
+                IsHitTestVisible="False" />
+    </Grid>
+</chrome:GlassWindow>

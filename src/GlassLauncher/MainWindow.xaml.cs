@@ -1,0 +1,2326 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Effects;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using GlassLauncher.Chrome;
+using GlassLauncher.Dialogs;
+using GlassLauncher.Models;
+using GlassLauncher.Services;
+
+namespace GlassLauncher;
+
+public partial class MainWindow : GlassWindow
+{
+    private readonly ObservableCollection<AppEntry> _entries = new();
+    private readonly DispatcherTimer _statusTimer;
+    private readonly DispatcherTimer _autoScrollTimer;
+
+    // 外部拖入（资源管理器）的插入位置
+    private int _insertIndex = -1;
+
+    // 手势状态
+    private Point _pressPoint;            // 按下时在网格里的位置
+    private Point _pointerInLayer;        // 指针最新位置（DragLayer 坐标，滚动时不变）
+    private AppEntry? _pressedEntry;
+
+    // 内部拖拽排序
+    private bool _dragActive;
+    private int _dragFrom = -1;
+    private int _dragTo = -1;
+    private Vector _grabOffset;            // 按下点相对图标中心的偏移，全程不变，保证“贴手”
+    private DragGhost? _ghost;
+    private readonly SlotShifter _slots = new();
+
+#if DEBUG
+    // 仅调试用：合成拖拽期间屏蔽真实鼠标事件，否则光标恰好压在窗口上时
+    // 一个没有按键的 MouseMove 就会把探针的手势取消掉
+    private bool _synthetic;
+
+    // 仅调试用：统计真实拖拽时 MouseMove 的到达间隔，用来判断“卡”到底是事件稀疏还是渲染慢
+    private readonly System.Diagnostics.Stopwatch _dragClock = new();
+    private double _lastMoveMs;
+    private int _moveCount;
+    private double _maxMoveGap;
+#endif
+    private double _autoScrollDelta;
+
+    // 光学玻璃：抓背后像素 + CPU 合成，替代 DWM 的 Acrylic
+    private readonly OpticalGlassSurface _glass;
+
+    // 冻结帧防抖：程序化尺寸变化（最大化、编程改大小）时事件只发一两次，
+    // 防抖后补抓一帧即可；交互拖动/缩放走下面的 live 模式，不经过这里
+    private readonly DispatcherTimer _refreezeTimer;
+
+    // 正在拖动/缩放窗口（模态循环里）。这个状态期间 RefreezeSoon 必须让路：
+    // LocationChanged/SizeChanged 在模态循环里也会冒出来，防止重复抓屏互相干扰
+    private bool _inModalMove;
+
+    // 背景抓屏的垫边（DIP）：抓屏区域比窗口四周各大一圈，显示时 1:1 映射。
+    // 这圈垫边有两个用途 —— 模糊采样在图像边缘会拿到透明而发暗（把淡出区推到窗外），
+    // 以及给"帧随窗动"的拖动方式留出模糊淡出的余地。必须与 XAML 里 FrozenSurface 的
+    // Margin=-48 严格一致，否则背景内容会被缩放/平移，与桌面错位。
+    private const double BackdropPad = 48;
+
+    // 冻结帧抓屏只在静止时跑（拖动期间让路排队），SetWindowDisplayAffinity
+    // 的开→抓→关都发生在静止状态 —— build 26300 上"排除开着进入模态拖动"
+    // 会让 DWM 停止呈现整个窗口，所以抓屏和拖动绝不同时发生
+    private bool _freezeBusy;
+
+    // 排除生效延迟：SetWindowDisplayAffinity 打开后 DWM 要过一两只合成帧才真正
+    // 把窗口从抓屏结果里摘掉，立刻抓会把窗口自己抓进背景（模糊后就是背景鬼影）
+    private const int ExclusionSettleMs = 60;
+
+    // FreezeBackdrop 忙时到达的补帧请求标记：忙完必须补跑一次（旧实现直接丢弃）
+    private bool _freezeQueued;
+
+    // 关闭动画播完的放行标记（见 Closing 拦截）
+    private bool _closeAnimated;
+
+    // 托盘常驻：平时窗口 Hide() 到托盘，快捷键 / 左键点托盘唤出，
+    // 只有托盘右键菜单的“退出”才真正结束进程（_exiting=true）
+    private Chrome.TrayIcon? _tray;
+    private bool _exiting;
+
+    // 搜索过滤激活中：视图只是主列表的子集，容器索引 ≠ 主列表索引，
+    // 排序拖拽按“容器索引即主列表索引”假设工作，此时必须禁用
+    private bool _filterActive;
+
+    // 用户设置（settings.json），见 SettingsDialog / ApplySettings
+    private LauncherSettings _settings = new();
+
+    private void RefreezeSoon()
+    {
+        if (_inModalMove)
+        {
+            return;
+        }
+
+        _refreezeTimer.Stop();
+        _refreezeTimer.Start();
+    }
+
+    /// <summary>
+    /// 描边层圆角与 DWM 裁剪同步：Normal 时 8px（DWMWCP_ROUND 的系统半径），
+    /// 最大化时 DWM 自动变直角，这里也跟着变，否则描边弧会在四角切出小缺口。
+    /// </summary>
+    private void UpdateLayerCorner()
+    {
+        bool maximized = WindowState == WindowState.Maximized;
+        EdgeLayer.CornerRadius = maximized ? default : new CornerRadius(8);
+        InnerLineLayer.CornerRadius = maximized ? default : new CornerRadius(7);
+        InnerLineLayer.Margin = maximized ? default : new Thickness(1);
+    }
+
+    /// <summary>
+    /// 挂 Win32 消息钩子：拖动/缩放窗口是 Win32 的模态循环，WPF 的事件和计时器
+    /// 在循环里照常触发，只有 WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE 能精确标记"松手"。
+    /// 顺手把托盘和全局快捷键也注册在这 —— 两者都需要窗口句柄。
+    /// </summary>
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+
+        var source = PresentationSource.FromVisual(this) as System.Windows.Interop.HwndSource;
+        source?.AddHook(WndProc);
+
+        InitTray();
+        ApplyHotkeySetting();
+    }
+
+    private void InitTray()
+    {
+        try
+        {
+            var stream = Application.GetResourceStream(new Uri("pack://application:,,,/app.ico")).Stream;
+            var icon = new System.Drawing.Icon(stream);
+
+            _tray = new Chrome.TrayIcon(icon, "Glass Launcher — 左键 打开/隐藏，右键 菜单");
+            _tray.LeftClick += ToggleLauncherWindow;
+            _tray.MenuOpen += ShowFromTray;
+            _tray.MenuSettings += () =>
+            {
+                ShowFromTray();
+                // 设置对话框要等窗口重新可见、重新激活之后再弹，否则焦点会打回托盘
+                Dispatcher.BeginInvoke(() => OnSettingsClick(this, new RoutedEventArgs()),
+                    DispatcherPriority.Background);
+            };
+            _tray.MenuExit += ExitApplication;
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"托盘初始化失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 全局快捷键注册（设置改了之后也会重新走这里）。
+    /// MOD_NOREPEAT：按住不放只触发一次，不然按住 Ctrl+Alt+G 会疯狂开关窗口。
+    /// </summary>
+    private void ApplyHotkeySetting()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        UnregisterHotKey(hwnd, HotkeyId);
+
+        if (!HotkeyHelper.TryParse(_settings.Hotkey, out uint modifiers, out uint virtualKey))
+        {
+            return;
+        }
+
+        if (!RegisterHotKey(hwnd, HotkeyId, modifiers | HotkeyHelper.ModNoRepeat, virtualKey))
+        {
+            ShowStatus($"快捷键 {_settings.Hotkey} 注册失败，可能被其他程序占用，可到设置里换一个");
+        }
+    }
+
+    private const int HotkeyId = 0xC0DE; // 本窗口内唯一的热键 id
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr processIdOut);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        const int WM_ENTERSIZEMOVE = 0x0231;
+        const int WM_EXITSIZEMOVE = 0x0232;
+        const int WM_HOTKEY = 0x0312;
+
+        switch (msg)
+        {
+            case WM_ENTERSIZEMOVE:
+                _inModalMove = true;
+                _refreezeTimer.Stop();
+                WndProc_DragStarted();
+                StartDragSampler();
+                break;
+
+            case WM_EXITSIZEMOVE:
+                _inModalMove = false;
+                WndProc_DragEnded();
+                // 松手后再采样 2 秒，看看窗口最后落在什么状态
+                StopDragSamplerAfterDelay();
+                break;
+
+            case WM_HOTKEY:
+                if (wParam.ToInt32() == HotkeyId)
+                {
+                    ToggleLauncherWindow();
+                    handled = true;
+                }
+
+                break;
+        }
+
+        return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// 进入拖动/缩放模态循环。
+    ///
+    /// ⚠ 这台机器的 Windows（build 26300 Insider）上，DisplayAffinity 开启 +
+    /// 模态拖动 = DWM 停止呈现整个窗口（一拖就整个消失/变黑，松手排除关掉才回来；
+    /// 常开也一样，且松手后不恢复）。所以拖动期间【绝不】设置排除、也【绝不】抓屏：
+    /// 背景就用拖动开始前的那一帧冻结帧，让它跟着窗口走（玻璃带着自己的模糊移动），
+    /// 松手后 RefreezeSoon 重新锚定桌面。
+    /// </summary>
+    private void StartDragRide()
+    {
+        // 帧随窗动：清掉上一轮松手的回落动画，偏移归零，
+        // 冻结帧与窗口 1:1 对齐一起移动，拖动期间视觉上完全稳定
+        FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+        FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+        FrozenShift.X = 0;
+        FrozenShift.Y = 0;
+    }
+
+    private void WndProc_DragStarted() => StartDragRide();
+
+    private void WndProc_DragEnded()
+    {
+        // 松手：窗口停稳了，重新锚定桌面（静止时短暂开排除抓帧是安全的）
+        RefreezeSoon();
+    }
+
+    public MainWindow()
+    {
+        InitializeComponent();
+
+        // 光学玻璃：只有显式把 Backdrop 设成 Optical 时才会真正工作（见 SyncGlassMode）
+        _glass = new OpticalGlassSurface(this, GlassSurface)
+        {
+            Radius = CornerRadius.TopLeft,
+            Band = 26,
+            Amplitude = 17,
+        };
+
+        AppItems.ItemsSource = _entries;
+        _entries.CollectionChanged += (_, _) =>
+        {
+            UpdateEmptyState();
+        };
+
+        _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _statusTimer.Tick += (_, _) =>
+        {
+            _statusTimer.Stop();
+            StatusBar.Visibility = Visibility.Collapsed;
+        };
+
+        // 拖到列表上下沿时自动滚动。用 16ms 的独立节拍，而不是“鼠标移动才滚”，
+        // 因为指针停在边缘不动时也应该继续滚（和 macOS 一致）。
+        _autoScrollTimer = new DispatcherTimer(DispatcherPriority.Render)
+        {
+            Interval = TimeSpan.FromMilliseconds(16),
+        };
+        _autoScrollTimer.Tick += (_, _) => AutoScrollTick();
+
+        LoadFromStore();
+
+        // 设置：加载 → 应用（主题/模糊/置顶）。应用列表与设置两份文件互不牵连
+        _settings = SettingsStore.Load(out string? settingsError);
+        if (settingsError is not null)
+        {
+            ShowStatus($"设置读取失败，已用默认值：{settingsError}");
+        }
+
+        ApplySettings();
+
+        UpdateEmptyState();
+
+        Closed += (_, _) =>
+        {
+            ClearDragFlags();
+            _tray?.Dispose();
+            Persist();
+        };
+
+        // 关闭拦截（托盘常驻语义）：
+        //   · Alt+F4 / 系统关机等 → 窗口不退出，播消失动画后 Hide() 到托盘；
+        //   · 托盘右键“退出”(_exiting=true) → 播完 mac 收场动画（缩到 0.94 + 淡出）再真关。
+        Closing += (_, e) =>
+        {
+            Diag.Log($"Closing closeAnimated={_closeAnimated} exiting={_exiting}");
+
+            if (_closeAnimated)
+            {
+                return;
+            }
+
+            e.Cancel = true;
+
+            if (_exiting)
+            {
+                PlayCloseThenClose();
+            }
+            else
+            {
+                HideToTray();
+            }
+        };
+
+        // 兜底：拖拽中窗口失活（Alt+Tab 切走、UAC 弹窗抢焦点），必须把手势收回来，
+        // 否则图标会一直悬在半空、条目也一直停在隐藏状态
+        Deactivated += (_, _) => CancelGesture();
+
+        // 冻结层全时制：DWM 实时 Acrylic 的模糊浓度是系统定死的（实测聚焦态糊成一坨），
+        // 而冻结帧的模糊（Radius=12）才是理想效果 —— 所以聚焦和失焦统一显示冻结帧。
+        // 附带收益：失焦灰板被不透明的冻结帧盖死，且两种状态像素完全一致，切换零跳变。
+        //
+        // 抓屏时机（详见 FreezeBackdrop / WndProc）：
+        //   · 静止时（绝大多数时间）：什么都不抓，复用现有冻结帧；
+        //   · 拖动/缩放中：绝不抓屏也不碰 DisplayAffinity —— 帧随窗动，
+        //     松手后 RefreezeSoon 重新锚定桌面（build 26300 上排除+拖动 = DWM 停止呈现）；
+        //   · 程序化尺寸/位置变化（最大化等）：防抖后补抓一帧。
+        _refreezeTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(120),
+        };
+        _refreezeTimer.Tick += (_, _) =>
+        {
+            _refreezeTimer.Stop();
+            FreezeBackdrop();
+        };
+        SizeChanged += (_, _) => RefreezeSoon();
+        // 程序化移动（SetWindowPos、保存的位置恢复等）不走模态循环，live 模式接不到，
+        // 靠这个补一帧；交互拖动期间 _inModalMove=true，这里会自动让路
+        LocationChanged += (_, _) => RefreezeSoon();
+        // 拖到另一个 DPI 的显示器（125%↔100%）时窗口逻辑尺寸会变，冻结帧的
+        // 像素映射全得重来，也补一帧（LocationChanged 通常也会触发，这里兜底）
+        DpiChanged += (_, e) =>
+        {
+            Diag.Log($"DpiChanged {e.OldDpi.DpiScaleX:F2} -> {e.NewDpi.DpiScaleX:F2} inModalMove={_inModalMove}");
+            RefreezeSoon();
+        };
+
+        // 可见性哨兵：Hide/Show 的每一次变化都留痕，"窗口凭空消失"从日志定性
+        IsVisibleChanged += (_, e) =>
+        {
+            Diag.Log($"IsVisibleChanged -> {e.NewValue} at {Environment.StackTrace.Split('\n').Skip(3).FirstOrDefault()?.Trim()}");
+        };
+        // 最大化时 DWM 会去掉圆角裁剪，描边层的 8px 弧会在四角切出小缺口，同步改直角
+        StateChanged += (_, _) => UpdateLayerCorner();
+
+        // 入场动效：等这一帧布局完成，容器才拿得到
+        Loaded += (_, _) =>
+        {
+            // 上次退出时的位置可能停在屏幕外，先拉回来再播入场
+            EnsureOnScreen();
+            Dispatcher.BeginInvoke(PlayEntrance, DispatcherPriority.Loaded);
+            // 第一帧背景：入场淡入会把它接住，不会白屏
+            Dispatcher.BeginInvoke(FreezeBackdrop, DispatcherPriority.Loaded);
+
+            // 设置里开了“启动时检查失效条目”才跑；检查是后台 IO，晚一拍不碍事
+            if (_settings.CheckBrokenOnStart)
+            {
+                Dispatcher.BeginInvoke(RunBrokenCheckAsync, DispatcherPriority.Background);
+            }
+        };
+
+        // Esc 分三级：拖拽中→放弃拖拽；搜索有字→清空搜索；其余→收到托盘
+        // （macOS 启动台按 Esc 就是收起，这里对齐）
+        PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key != Key.Escape)
+            {
+                return;
+            }
+
+            if (_dragActive)
+            {
+                EndDrag(commit: false);
+            }
+            else if (SearchBox.Text.Length > 0)
+            {
+                SearchBox.Clear();
+            }
+            else
+            {
+                HideToTray();
+            }
+
+            e.Handled = true;
+        };
+
+#if DEBUG
+        ApplyBackdropProbe();
+        SeedFromEnvironment();
+        Loaded += (_, _) => RunDebugProbes();
+#endif
+
+        SyncGlassMode();
+    }
+
+    /// <summary>
+    /// 光学玻璃与 XAML 描边只能二选一：
+    ///   · 光学模式：位图自带模糊、棱和高光 → 关掉 XAML 那几层，否则叠成双线；
+    ///   · Acrylic 模式：位图不存在 → 必须把 XAML 那几层显示回来，玻璃的“棱”全靠它们。
+    ///
+    /// 另外光学模式下每次抓图都要临时开关截屏排除，那一下必然闪一帧。
+    /// 所以它不再是默认路径，只有 Backdrop 被显式设成 Optical 才启用。
+    /// </summary>
+    private void SyncGlassMode()
+    {
+        bool optical = Backdrop == GlassBackdrop.Optical;
+
+        _glass.Enabled = optical;
+
+        Visibility layers = optical ? Visibility.Collapsed : Visibility.Visible;
+        SheenLayer.Visibility = layers;
+        EdgeLayer.Visibility = layers;
+        InnerLineLayer.Visibility = layers;
+        SpecularLayer.Visibility = layers;
+
+        if (optical)
+        {
+            _glass.Attach();
+            _glass.Refresh();
+        }
+        else
+        {
+            // 切回 DWM 材质时必须清掉位图，否则整块 Image 会把 Acrylic 盖死
+            GlassSurface.Source = null;
+        }
+    }
+
+    /// <summary>
+    /// 背景冻结：DWM 的系统 Acrylic 有两个绕不开的毛病 —— 失焦退化成不透明的灰板
+    /// （系统写死的行为），以及聚焦态的实时模糊浓度过高（同样不可调）。
+    /// 唯一出路是干脆不让 DWM 的模糊露脸：抓一帧真实背景（截屏排除保证抓到的是
+    /// "我们盖住的那片"，不是我们自己），GPU 高斯模糊后全程盖在上面。
+    ///
+    /// 抓屏时机：启动后第一帧（Loaded）+ 程序化尺寸/位置变化（防抖）+ 松手重新锚定。
+    /// 只在【静止】时抓 —— 开→抓→关整个发生在静止状态；
+    /// 拖动/缩放期间绝不碰 DisplayAffinity（build 26300 上排除开着进模态拖动 =
+    /// DWM 停止呈现窗口：一拖就整个消失/变黑，松手才回来），拖动期间帧随窗动。
+    ///
+    /// 异步的原因：SetWindowDisplayAffinity 打开后 DWM 要过一两只合成帧才真正落实排除，
+    /// 同步抓会把窗口自己抓进背景（背景里出现自己图标的模糊鬼影）。等 60ms 再抓。
+    /// </summary>
+    private async void FreezeBackdrop()
+    {
+        // 光学模式自己就是真背景；Mica 失焦不退化；没有基底更不用管
+        if (Backdrop is GlassBackdrop.Optical or GlassBackdrop.Mica or GlassBackdrop.None)
+        {
+            return;
+        }
+
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero || ActualWidth < 40 || ActualHeight < 40)
+        {
+            return;
+        }
+
+        if (_freezeBusy)
+        {
+            // 忙时不能丢请求：记一次，当前帧抓完用【新位置】补跑。
+            // 之前直接 return —— 等待期间窗口被移动时到达的补帧会被吞掉，
+            // 冻结帧就永远停在旧位置（背景整体错位的来源之一）
+            _freezeQueued = true;
+            return;
+        }
+
+        if (_inModalMove)
+        {
+            // 拖动期间冻结帧让路：抓屏+排除绝不能发生在模态拖动里
+            _freezeQueued = true;
+            return;
+        }
+
+        _freezeBusy = true;
+
+        try
+        {
+            if (!ScreenGrab.TrySetExclusion(hwnd, true))
+            {
+                return;
+            }
+
+            try
+            {
+                // 等待期间窗口可能在移动（LocationChanged 还会再触发防抖），
+                // 所以位置/DPI/尺寸必须全部在等待【之后】读
+                await Task.Delay(ExclusionSettleMs);
+
+                DpiScale dpi = VisualTreeHelper.GetDpi(this);
+                Point origin = PointToScreen(new Point(0, 0));
+                // 与显示端同套几何：抓屏区域比窗口四周各大 BackdropPad，
+                // 显示端 Margin=-48 + Stretch=Fill 恰好 1:1 映射，背景与桌面像素级对齐
+                int width = (int)Math.Ceiling((ActualWidth + BackdropPad * 2) * dpi.DpiScaleX);
+                int height = (int)Math.Ceiling((ActualHeight + BackdropPad * 2) * dpi.DpiScaleY);
+
+                byte[]? pixels = ScreenGrab.Capture(
+                    (int)Math.Round(origin.X - BackdropPad * dpi.DpiScaleX),
+                    (int)Math.Round(origin.Y - BackdropPad * dpi.DpiScaleY),
+                    width, height);
+
+                if (pixels is null)
+                {
+                    return;
+                }
+
+                var bitmap = new WriteableBitmap(width, height, dpi.DpiScaleX * 96, dpi.DpiScaleY * 96,
+                    PixelFormats.Bgra32, null);
+                bitmap.WritePixels(new Int32Rect(0, 0, width, height), pixels, width * 4, 0);
+
+                // 静态帧没有位移预测，偏移必须归零（上一轮的回落动画可能还没走完）
+                FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+                FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+                FrozenShift.X = 0;
+                FrozenShift.Y = 0;
+                FrozenSurface.Source = bitmap;
+                FrozenBackdropHost.Visibility = Visibility.Visible;
+            }
+            finally
+            {
+                // 抓完立刻放开：用户正常截图/录屏时窗口必须可见
+                ScreenGrab.TrySetExclusion(hwnd, false);
+            }
+        }
+        finally
+        {
+            _freezeBusy = false;
+
+            // 排队的那次补跑：此刻窗口已停稳，用最新位置抓
+            if (_freezeQueued)
+            {
+                _freezeQueued = false;
+                Dispatcher.BeginInvoke(FreezeBackdrop, DispatcherPriority.Loaded);
+            }
+        }
+    }
+
+    // ── 托盘常驻 ────────────────────────────────────────────────
+
+    // 拖动期采样器（行车记录仪）：120ms 一拍记录 rect/透明度/缩放/前台窗口，
+    // 每 3 拍抓一张屏幕存图。"窗口凭空消失"复现时靠它定性是 off-screen、
+    // 内容塌了还是被压到别人后面
+    private DispatcherTimer? _dragSampler;
+    private int _dragSamplerTicks;
+    private int _sampleSeq;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECTlp rect);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int count);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct RECTlp
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    private void StartDragSampler()
+    {
+#if DEBUG
+        _dragSamplerTicks = 0;
+
+        if (_dragSampler is null)
+        {
+            _dragSampler = new DispatcherTimer(DispatcherPriority.Send)
+            {
+                Interval = TimeSpan.FromMilliseconds(120),
+            };
+            _dragSampler.Tick += (_, _) => SampleDragState();
+        }
+
+        _dragSampler.Start();
+        SampleDragState();
+#endif
+    }
+
+    private void StopDragSamplerAfterDelay()
+    {
+#if !DEBUG
+        return;
+#endif
+        // 立刻停会导致最后一拍看不到松手后的状态；延 2 秒停
+        var t = new DispatcherTimer(DispatcherPriority.Send) { Interval = TimeSpan.FromSeconds(2) };
+        t.Tick += (_, _) =>
+        {
+            t.Stop();
+            _dragSampler?.Stop();
+            Diag.Log("sampler stopped");
+        };
+        t.Start();
+    }
+
+    private void SampleDragState()
+    {
+        _dragSamplerTicks++;
+
+        try
+        {
+            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            GetWindowRect(hwnd, out RECTlp r);
+
+            IntPtr fg = GetForegroundWindow();
+            var fgTitle = new System.Text.StringBuilder(128);
+            _ = GetWindowText(fg, fgTitle, 128);
+
+            Diag.Log($"SAMPLE#{_dragSamplerTicks} rect=({r.Left},{r.Top},{r.Right},{r.Bottom}) "
+                + $"wpf=({Left:F0},{Top:F0} {ActualWidth:F0}x{ActualHeight:F0}) "
+                + $"opacity={Shell.Opacity:F2} scale={ShellScale.ScaleX:F2} vis={IsVisible} "
+                + $"state={WindowState} backdrop={FrozenBackdropHost.Visibility} fg='{fgTitle}'");
+
+            // 每 3 拍存一张整屏截图
+            if (_dragSamplerTicks % 3 == 0)
+            {
+                _sampleSeq++;
+                string dir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "GlassLauncher", "samples");
+                System.IO.Directory.CreateDirectory(dir);
+                string path = System.IO.Path.Combine(dir, $"drag{_sampleSeq:D3}.png");
+
+                int w = SystemParameters.PrimaryScreenWidth is { } pw ? (int)(pw * 1) : 0;
+                // 用物理分辨率抓全屏（虚拟桌面）
+                int vx = System.Math.Max(0, (int)SystemParameters.VirtualScreenLeft);
+                int vy = System.Math.Max(0, (int)SystemParameters.VirtualScreenTop);
+                int vw = (int)SystemParameters.VirtualScreenWidth;
+                int vh = (int)SystemParameters.VirtualScreenHeight;
+
+                using var bmp = new System.Drawing.Bitmap(vw * 5 / 4, vh * 5 / 4);
+                using (var g = System.Drawing.Graphics.FromImage(bmp))
+                {
+                    g.CopyFromScreen(vx, vy, 0, 0, bmp.Size);
+                }
+
+                bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+                Diag.Log($"SAMPLE shot -> {path}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Diag.Log($"SAMPLE error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 托盘左键 / 全局快捷键共用：可见就收起，不可见（或最小化）就唤出。
+    /// </summary>
+    private void ToggleLauncherWindow()
+    {
+        Diag.Log($"Toggle visible={IsVisible} state={WindowState}");
+
+        if (!IsVisible)
+        {
+            ShowFromTray();
+        }
+        else if (WindowState == WindowState.Minimized)
+        {
+            // 最小化的窗口点托盘应该是唤回，而不是再收一次
+            WindowState = WindowState.Normal;
+            Activate();
+        }
+        else
+        {
+            HideToTray();
+        }
+    }
+
+    /// <summary>
+    /// 收到托盘：先播 mac 收场动画（缩到 0.94 + 淡出），播完才真的 Hide()。
+    /// Hide 之后立刻把 Shell 的动画值复位 —— 动画是 HoldEnd 的，不复位的话
+    /// 下次唤出的第一帧就是透明缩小的残影。
+    /// </summary>
+    private void HideToTray(string reason = "toggle")
+    {
+        Diag.Log($"HideToTray reason={reason} visible={IsVisible} inModalMove={_inModalMove} dragActive={_dragActive}");
+
+        if (!IsVisible)
+        {
+            return;
+        }
+
+        CancelGesture();
+
+        // 中断位移预测的回落动画并把偏移清零：带着非零偏移隐藏的话，
+        // 唤出时补帧万一被吞，旧帧就是整体错位的（背景错位的来源之一）
+        FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+        FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+        FrozenShift.X = 0;
+        FrozenShift.Y = 0;
+
+        var ease = new CubicEase { EasingMode = EasingMode.EaseIn };
+        var fade = new DoubleAnimation(0, TimeSpan.FromMilliseconds(180)) { EasingFunction = ease };
+        var shrinkX = new DoubleAnimation(0.94, TimeSpan.FromMilliseconds(180)) { EasingFunction = ease };
+        var shrinkY = new DoubleAnimation(0.94, TimeSpan.FromMilliseconds(180)) { EasingFunction = ease };
+
+        fade.Completed += (_, _) =>
+        {
+            Diag.Log("HideToTray fade completed -> Hide()");
+            Hide();
+            ResetShellTransform();
+        };
+
+        Shell.BeginAnimation(OpacityProperty, fade, HandoffBehavior.SnapshotAndReplace);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, shrinkX, HandoffBehavior.SnapshotAndReplace);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, shrinkY, HandoffBehavior.SnapshotAndReplace);
+    }
+
+    /// <summary>
+    /// 唤出/启动时把窗口拉回可视区：窗口可以被正常地拖到屏幕边缘外（Windows 原生行为），
+    /// 但托盘唤出如果原位显示，一个停在屏幕外的窗口看起来就是“消失了”。
+    /// 规则：可见部分不足 260x180（且窗口本身比这大）就把位置夹回最近显示器的工作区内。
+    /// </summary>
+    private void EnsureOnScreen()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        GetWindowRect(hwnd, out RECTlp r);
+
+        var monitor = new MONITORINFOEXW
+        {
+            CbSize = MarshalSizeOfMonitorInfo(),
+        };
+        IntPtr hMonitor = MonitorFromRect(ref r, MONITOR_DEFAULTTONEAREST);
+
+        if (!GetMonitorInfo(hMonitor, ref monitor))
+        {
+            return;
+        }
+
+        RectW work = monitor.RcWork;
+        int width = r.Right - r.Left;
+        int height = r.Bottom - r.Top;
+        int visibleWidth = Math.Min(r.Right, work.Right) - Math.Max(r.Left, work.Left);
+        int visibleHeight = Math.Min(r.Bottom, work.Bottom) - Math.Max(r.Top, work.Top);
+
+        // 可见部分不足窗口自身的 60% 就算"停丢了"：启动器是个整体面板，
+        // 露一条边（1/3 宽）对用户来说和消失没有区别
+        int minVisibleX = (int)(width * 0.6);
+        int minVisibleY = (int)(height * 0.6);
+
+        bool tooFarOut = visibleWidth < Math.Min(minVisibleX, width)
+            || visibleHeight < Math.Min(minVisibleY, height);
+
+        if (!tooFarOut)
+        {
+            return;
+        }
+
+        int targetLeft = Math.Clamp(r.Left, work.Left - width + minVisibleX, work.Right - minVisibleX);
+        int targetTop = Math.Clamp(r.Top, work.Top - height + minVisibleY, work.Bottom - minVisibleY);
+
+        DpiScale dpi = VisualTreeHelper.GetDpi(this);
+        Left = targetLeft / dpi.DpiScaleX;
+        Top = targetTop / dpi.DpiScaleY;
+
+        Diag.Log($"EnsureOnScreen: ({r.Left},{r.Top}) -> ({targetLeft},{targetTop}) "
+            + $"work=({work.Left},{work.Top},{work.Right},{work.Bottom})");
+    }
+
+    private const int MONITOR_DEFAULTTONEAREST = 2;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromRect(ref RECTlp rect, int flags);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFOEXW info);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct RectW
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private struct MONITORINFOEXW
+    {
+        public int CbSize;
+        public RectW RcMonitor;
+        public RectW RcWork;
+        public uint DwFlags;
+
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string SzDevice;
+    }
+
+    private static int MarshalSizeOfMonitorInfo() => System.Runtime.InteropServices.Marshal.SizeOf<MONITORINFOEXW>();
+
+    /// <summary>
+    /// 从托盘唤出：mac 出现动画 —— 整窗淡入 + 从 1.05 缩回 1，图标再依次弹入
+    /// （与首次启动共用 PlayEntrance），然后补抓一帧背景。
+    /// </summary>
+    private void ShowFromTray()
+    {
+        Diag.Log($"ShowFromTray visible={IsVisible} state={WindowState} inModalMove={_inModalMove}");
+
+        if (IsVisible)
+        {
+            if (WindowState == WindowState.Minimized)
+            {
+                WindowState = WindowState.Normal;
+            }
+
+            Activate();
+            return;
+        }
+
+        if (WindowState == WindowState.Minimized)
+        {
+            WindowState = WindowState.Normal;
+        }
+
+        ResetShellTransform();
+        Show();
+        EnsureOnScreen();
+        ForceForeground();
+
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+        var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(300)) { EasingFunction = ease };
+        var growX = new DoubleAnimation(1.05, 1, TimeSpan.FromMilliseconds(320)) { EasingFunction = ease };
+        var growY = new DoubleAnimation(1.05, 1, TimeSpan.FromMilliseconds(320)) { EasingFunction = ease };
+
+        Shell.BeginAnimation(OpacityProperty, fade, HandoffBehavior.SnapshotAndReplace);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, growX, HandoffBehavior.SnapshotAndReplace);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, growY, HandoffBehavior.SnapshotAndReplace);
+
+        Dispatcher.BeginInvoke(PlayEntrance, DispatcherPriority.Loaded);
+        Dispatcher.BeginInvoke(FreezeBackdrop, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>
+    /// 强制前台。Window.Activate() 在“其他程序是前台”时会失败 —— Windows 不允许
+    /// 后台进程随便抢焦点（实测复现：从别的应用按快捷键，窗口 Show 了但被压在
+    /// 别人下面，看起来就是“唤不起来”）。
+    /// 绕法是经典三步：临时把输入队列和当前前台窗口接在一起（AttachThreadInput），
+    /// 我们就“有资格”设置前台了，然后 BringWindowToTop + SetForegroundWindow。
+    /// </summary>
+    private void ForceForeground()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        IntPtr foreground = GetForegroundWindow();
+        uint foregroundThread = GetWindowThreadProcessId(foreground, IntPtr.Zero);
+        uint currentThread = GetCurrentThreadId();
+
+        bool attached = foreground != IntPtr.Zero
+            && foregroundThread != 0
+            && foregroundThread != currentThread
+            && AttachThreadInput(currentThread, foregroundThread, true);
+
+        try
+        {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+            Activate();
+        }
+        finally
+        {
+            if (attached)
+            {
+                AttachThreadInput(currentThread, foregroundThread, false);
+            }
+        }
+    }
+
+    /// <summary>托盘右键“退出”：落盘一次，播收场动画后真关（Closing 里 _exiting 放行）。</summary>
+    private void ExitApplication()
+    {
+        _exiting = true;
+        Persist();
+        Close();
+    }
+
+    /// <summary>把 Shell 的透明度/缩放动画全部清掉并复位到 1（隐藏后复位的公共步骤）。</summary>
+    private void ResetShellTransform()
+    {
+        Shell.BeginAnimation(OpacityProperty, null);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+        Shell.Opacity = 1;
+        ShellScale.ScaleX = 1;
+        ShellScale.ScaleY = 1;
+    }
+
+    // ── 动效 ────────────────────────────────────────────────────
+    //
+    // macOS 启动台的“活”来自三件事，这里逐条对上：
+    //   1) 打开时图标不是一起出现，而是从左上到右下依次弹入（stagger + 轻微过冲）；
+    //   2) 悬停是弹簧，不是线性放大（轻微冲过再回落，见 XAML 里的 ElasticEase）；
+    //   3) 点下去有一记回弹，告诉你“收到了”，而不是等程序启动才有反应。
+    //
+    // 全部只动 RenderTransform / Opacity，不碰布局，40 多个图标同时跑也不掉帧。
+
+    /// <summary>关闭动画：整窗缩到 0.94 + 淡出（200ms），播完真关。</summary>
+    private void PlayCloseThenClose()
+    {
+        var fade = new DoubleAnimation(0, TimeSpan.FromMilliseconds(200))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+        };
+        var shrinkX = new DoubleAnimation(0.94, TimeSpan.FromMilliseconds(200))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+        };
+        var shrinkY = new DoubleAnimation(0.94, TimeSpan.FromMilliseconds(200))
+        {
+            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseIn },
+        };
+
+        fade.Completed += (_, _) =>
+        {
+            _closeAnimated = true;
+            Close();
+        };
+
+        Shell.BeginAnimation(OpacityProperty, fade, HandoffBehavior.SnapshotAndReplace);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, shrinkX, HandoffBehavior.SnapshotAndReplace);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, shrinkY, HandoffBehavior.SnapshotAndReplace);
+    }
+
+    /// <summary>入场：图标按顺序弹入。集合越大间隔越小，避免 40 个图标排到两秒后。</summary>
+    private void PlayEntrance()
+    {
+        int count = _entries.Count;
+        if (count == 0)
+        {
+            return;
+        }
+
+        AppItems.UpdateLayout();
+
+        double stagger = Math.Min(0.020, 0.42 / count);
+        var grow = new BackEase { Amplitude = 0.22, EasingMode = EasingMode.EaseOut };
+
+        for (int i = 0; i < count; i++)
+        {
+            if (AppItems.ItemContainerGenerator.ContainerFromIndex(i) is not FrameworkElement container
+                || FindTemplatePart(container, "Root") is not FrameworkElement root
+                || root.RenderTransform is not ScaleTransform scale)
+            {
+                continue;
+            }
+
+            // 基准值先摆好：FillBehavior=Stop 时动画结束会回到基准，回到 1 才不会有一下闪。
+            root.Opacity = 1;
+            scale.ScaleX = 1;
+            scale.ScaleY = 1;
+
+            var begin = TimeSpan.FromSeconds(i * stagger);
+
+            var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(200))
+            {
+                BeginTime = begin,
+                FillBehavior = FillBehavior.Stop,
+            };
+
+            var pop = new DoubleAnimation(0.86, 1, TimeSpan.FromMilliseconds(340))
+            {
+                BeginTime = begin,
+                EasingFunction = grow,
+                FillBehavior = FillBehavior.Stop,
+            };
+
+            root.BeginAnimation(OpacityProperty, fade);
+            scale.BeginAnimation(ScaleTransform.ScaleXProperty, pop);
+            scale.BeginAnimation(ScaleTransform.ScaleYProperty, pop);
+        }
+    }
+
+    /// <summary>点下去的确认感：放大 14% 再弹回，全程 260ms。</summary>
+    private void PlayLaunchBounce(AppEntry entry)
+    {
+        if (AppItems.ItemContainerGenerator.ContainerFromItem(entry) is not FrameworkElement container
+            || FindTemplatePart(container, "Root") is not FrameworkElement root
+            || root.RenderTransform is not ScaleTransform scale)
+        {
+            return;
+        }
+
+        var bounce = new DoubleAnimationUsingKeyFrames { FillBehavior = FillBehavior.Stop };
+        bounce.KeyFrames.Add(new EasingDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.Zero)));
+        bounce.KeyFrames.Add(new EasingDoubleKeyFrame(1.14, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(90))
+            , new QuadraticEase { EasingMode = EasingMode.EaseOut }));
+        bounce.KeyFrames.Add(new EasingDoubleKeyFrame(1, KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(270))
+            , new CubicEase { EasingMode = EasingMode.EaseOut }));
+
+        scale.BeginAnimation(ScaleTransform.ScaleXProperty, bounce);
+        scale.BeginAnimation(ScaleTransform.ScaleYProperty, bounce);
+    }
+
+    /// <summary>在模板里按 x:Name 找元素（DataTemplate 里的 Root / RootScale 不在命名域里，找不到名字）。</summary>
+    private static FrameworkElement? FindTemplatePart(DependencyObject root, string name)
+    {
+        if (root is FrameworkElement element && element.Name == name)
+        {
+            return element;
+        }
+
+        int children = VisualTreeHelper.GetChildrenCount(root);
+
+        for (int i = 0; i < children; i++)
+        {
+            FrameworkElement? found = FindTemplatePart(VisualTreeHelper.GetChild(root, i), name);
+
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    // ── 持久化 ──────────────────────────────────────────────────
+
+    private void LoadFromStore()
+    {
+        List<AppEntry> loaded = LauncherStore.Load(out string? error);
+
+        foreach (AppEntry entry in loaded)
+        {
+            entry.Icon = IconService.LoadOrCreate(entry);
+            _entries.Add(entry);
+        }
+
+        if (error is not null)
+        {
+            ShowStatus($"读取数据失败：{error}");
+        }
+    }
+
+    /// <summary>写回磁盘。顺序变化后务必先 Renumber 再保存，否则重开后顺序会乱。</summary>
+    private void Persist()
+    {
+        Renumber();
+
+        if (!LauncherStore.Save(_entries, out string? error) && error is not null)
+        {
+            ShowStatus($"保存失败：{error}");
+        }
+    }
+
+    /// <summary>启动时异步检查失效条目，结果回到 UI 线程再改属性。</summary>
+    private async void RunBrokenCheckAsync()
+    {
+        if (_entries.Count == 0)
+        {
+            return;
+        }
+
+        IReadOnlyList<BrokenCheckResult> results =
+            await BrokenChecker.CheckAsync(new List<AppEntry>(_entries).AsReadOnly());
+
+        bool changed = false;
+        foreach (BrokenCheckResult result in results)
+        {
+            if (result.Entry.IsBroken != result.IsBroken)
+            {
+                result.Entry.IsBroken = result.IsBroken;
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            Persist();
+        }
+    }
+
+    // ── 网格内拖拽排序 ──────────────────────────────────────────
+    //
+    // 这套手势是自己接鼠标事件实现的，没有走 OLE 的 DoDragDrop。原因有三条，都是实测出来的：
+    //
+    //   1) DoDragDrop 期间鼠标位置只能从 IDropTarget.DragOver 里拿，事件到达频率由系统决定，
+    //      预览必然每隔几帧才动一下 —— 这就是“一卡一卡”的主因；
+    //   2) 每收到一次 DragOver 都要摸一遍布局（UpdateLayout + 逐项 TranslatePoint），
+    //      几十个条目被反复重排，越拖越黏；
+    //   3) 截图对比时还发现，OLE 拖放期间系统的拖拽循环会改写光标反馈，
+    //      我们再怎么调都是一顿一顿。
+    //
+    // 改成 MouseMove 里 1:1 跟随之后，指针移动多少像素，图标就走多少像素，
+    // 中间没有任何异步环节，手感才和 macOS 启动台一致。
+    // 外部文件拖入仍然走 WPF 原生的 DragOver/Drop，两条通道互不干扰。
+    //
+    // 视觉上也不再画那条蓝色插入线：受影响的一串图标会顺次挪一格，空出的格子就是落点。
+    // 位移全部走 RenderTransform 补间，不触发重新布局，所以“让位”是滑过去的而不是跳过去的。
+
+    private const double DragStartThreshold = 6;   // 小于它算单击，大于它才算拖
+    private const double AutoScrollEdge = 26;      // 距离上下沿多近开始自动滚动
+    private const double AutoScrollStep = 16;      // 每个节拍滚多少像素
+
+    private void OnItemMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+#if DEBUG
+        if (_synthetic)
+        {
+            return;
+        }
+#endif
+
+        if (sender is not FrameworkElement element || element.DataContext is not AppEntry entry)
+        {
+            return;
+        }
+
+        _pressedEntry = entry;
+        _pressPoint = e.GetPosition(AppItems);
+        _pointerInLayer = e.GetPosition(DragLayer);
+
+        // 按下就捕获鼠标：手快的时候指针一下子甩出条目范围，
+        // 没有捕获就会丢 MouseMove / MouseUp，手势停在半路。
+        element.CaptureMouse();
+    }
+
+    private void OnItemMouseMove(object sender, MouseEventArgs e)
+    {
+#if DEBUG
+        if (_synthetic)
+        {
+            return;
+        }
+#endif
+
+        if (_pressedEntry is null)
+        {
+            return;
+        }
+
+        // 在别处松手（或者收到了不配对的抬起）时别把状态卡住
+        if (e.LeftButton != MouseButtonState.Pressed)
+        {
+            CancelGesture();
+            return;
+        }
+
+        _pointerInLayer = e.GetPosition(DragLayer);
+
+#if DEBUG
+        if (_dragActive)
+        {
+            double now = _dragClock.Elapsed.TotalMilliseconds;
+            double gap = now - _lastMoveMs;
+            _lastMoveMs = now;
+
+            if (gap > _maxMoveGap)
+            {
+                _maxMoveGap = gap;
+            }
+
+            _moveCount++;
+        }
+#endif
+
+        if (!_dragActive)
+        {
+            Vector delta = e.GetPosition(AppItems) - _pressPoint;
+
+            if (Math.Abs(delta.X) < DragStartThreshold && Math.Abs(delta.Y) < DragStartThreshold)
+            {
+                return;
+            }
+
+            if (!BeginDrag())
+            {
+                // 格子快照拿不全就退化成普通点击，绝不半拖
+                _pressedEntry = null;
+                ReleaseCapture();
+                return;
+            }
+        }
+
+        UpdateDrag(_pointerInLayer);
+        UpdateAutoScroll(e.GetPosition(GridScroller));
+    }
+
+    private void OnItemMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+#if DEBUG
+        if (_synthetic)
+        {
+            return;
+        }
+#endif
+
+        if (_dragActive)
+        {
+            EndDrag(commit: true);
+            e.Handled = true;
+            return;
+        }
+
+        AppEntry? pressed = _pressedEntry;
+        bool sameItem = sender is FrameworkElement element && ReferenceEquals(element.DataContext, pressed);
+
+        Point release = e.GetPosition(AppItems);
+        Vector delta = release - _pressPoint;
+
+        _pressedEntry = null;
+        ReleaseCapture();
+
+        if (pressed is null || !sameItem)
+        {
+            return;
+        }
+
+        // 位移超过阈值却没能起拖（比如格子快照失败）→ 什么都不做，避免误启动
+        if (Math.Abs(delta.X) >= DragStartThreshold || Math.Abs(delta.Y) >= DragStartThreshold)
+        {
+            return;
+        }
+
+        LaunchEntry(pressed, asAdministrator: false);
+    }
+
+    /// <summary>捕获被系统或别的元素抢走时的兜底。</summary>
+    private void OnItemLostMouseCapture(object sender, MouseEventArgs e)
+    {
+        if (_dragActive)
+        {
+            EndDrag(commit: false);
+        }
+        else
+        {
+            _pressedEntry = null;
+        }
+    }
+
+    private void CancelGesture()
+    {
+        if (_dragActive)
+        {
+            EndDrag(commit: false);
+            return;
+        }
+
+        _pressedEntry = null;
+        ReleaseCapture();
+    }
+
+    private static void ReleaseCapture() => Mouse.Captured?.ReleaseMouseCapture();
+
+    /// <summary>把光标下的图标“拿起来”：隐藏原位、生成浮起副本、开始记录格子。</summary>
+    private bool BeginDrag()
+    {
+        // 搜索过滤激活时视图是主列表的子集：容器索引（SlotShifter 记的格子、落点）
+        // 和主列表索引对不上，硬排序必然乱序。降级为普通点击（单击仍然能启动应用）。
+        if (_filterActive)
+        {
+            return false;
+        }
+
+        if (_pressedEntry is not { } entry)
+        {
+            return false;
+        }
+
+        int from = _entries.IndexOf(entry);
+
+        if (from < 0 || !_slots.Capture(AppItems))
+        {
+            return false;
+        }
+
+        Point center = _slots.IconCenterAt(from);
+
+        // 记住“按下点相对图标中心”的偏移，全程不改；
+        // 这样从图标角落按下去也不会在起飞瞬间把图标吸到光标正中。
+        _grabOffset = _pressPoint - center;
+
+        // 上一轮落位动画还没播完就又开始拖：先把可能残留的隐藏标记清掉
+        foreach (AppEntry other in _entries)
+        {
+            if (other.IsDragging && !ReferenceEquals(other, entry))
+            {
+                other.IsDragging = false;
+            }
+        }
+
+        _dragFrom = from;
+        _dragTo = from;
+        _dragActive = true;
+
+        // 原位隐藏由数据驱动（模板里绑 IsDragging），Move 之后容器重新绑定也不会找错人
+        entry.IsDragging = true;
+
+        _ghost = new DragGhost(DragLayer, entry.Icon, entry.Initial, (Brush)FindResource("ItemInitialBrush"));
+        _ghost.MoveTo(center);   // 先在原位出现，与被隐藏的图标严丝合缝
+        _ghost.Lift();
+
+        _autoScrollDelta = 0;
+        _autoScrollTimer.Start();
+
+#if DEBUG
+        _dragClock.Restart();
+        _lastMoveMs = 0;
+        _moveCount = 0;
+        _maxMoveGap = 0;
+#endif
+
+        return true;
+    }
+
+    /// <summary>拖拽中：算落点、让邻居让位、把副本摆到光标下。每次 MouseMove 都会走一遍，必须极轻。</summary>
+    private void UpdateDrag(Point pointerInLayer)
+    {
+        if (!_dragActive || _ghost is null)
+        {
+            return;
+        }
+
+        Point pointerInGrid = DragLayer.TranslatePoint(pointerInLayer, AppItems);
+        int to = SlotAt(pointerInGrid);
+
+        if (to != _dragTo)
+        {
+            _dragTo = to;
+            _slots.ApplyGap(_dragFrom, to);
+        }
+
+        _ghost.MoveTo(pointerInLayer - _grabOffset);
+    }
+
+    /// <summary>
+    /// 指针压在哪一格上，就落到哪一格。
+    ///
+    /// 这里刻意不用“插到某两格之间”的算法：那种算法在指针正好压住某格中心时，
+    /// 会因为“左半边=插前面”的判定把落点放到左边一格，松手瞬间图标还要横跳半格。
+    /// 大图标网格里，用户认定的落点就是光标底下这一格，取最近中心最符合直觉，
+    /// 也让浮起的副本始终正好悬在空出来的格子上。
+    /// </summary>
+    private int SlotAt(Point position)
+    {
+        int count = _entries.Count;
+
+        if (count == 0)
+        {
+            return 0;
+        }
+
+        int best = 0;
+        double bestDistance = double.MaxValue;
+
+        for (int i = 0; i < count; i++)
+        {
+            Rect bounds = _slots.RectAt(i);
+
+            if (bounds.IsEmpty)
+            {
+                continue;
+            }
+
+            double dx = position.X - (bounds.Left + (bounds.Width / 2));
+            double dy = position.Y - (bounds.Top + (bounds.Height / 2));
+            double distance = (dx * dx) + (dy * dy);
+
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = i;
+            }
+        }
+
+        return best;
+    }
+
+    /// <summary>收尾：把条目落到目标格，让副本飞回去淡出。</summary>
+    private void EndDrag(bool commit)
+    {
+        if (!_dragActive)
+        {
+            return;
+        }
+
+#if DEBUG
+        Diag.Log($"EndDrag commit={commit} from={_dragFrom} to={_dragTo} moves={_moveCount} "
+            + $"maxGap={_maxMoveGap:0.0}ms avgGap={(_moveCount > 1 ? _dragClock.Elapsed.TotalMilliseconds / _moveCount : 0):0.0}ms "
+            + $"via={new System.Diagnostics.StackTrace(1, false).GetFrame(0)?.GetMethod()?.Name}");
+#endif
+
+        // 先把状态一次性取出来：下面 ReleaseMouseCapture 会同步触发 LostMouseCapture，
+        // 可能重入到这里，取完局部量之后随便重入都不会把状态搅乱。
+        AppEntry? entry = _pressedEntry;
+        int from = _dragFrom;
+        int to = _dragTo;
+        DragGhost? ghost = _ghost;
+
+        _dragActive = false;
+        _dragFrom = -1;
+        _dragTo = -1;
+        _pressedEntry = null;
+        _ghost = null;
+        _autoScrollDelta = 0;
+        _autoScrollTimer.Stop();
+
+        int landing = commit ? to : from;
+        Point landingCenter = AppItems.TranslatePoint(_slots.IconCenterAt(landing), DragLayer);
+
+        if (commit && entry is not null && to != from && to >= 0)
+        {
+            _entries.Move(from, to);
+        }
+
+        // 关键顺序：Move 之后、重新布局之前清位移。
+        // 此刻每个容器的真实位置正好等于它刚才被推到的位置，归零不会出现任何跳变。
+        _slots.Reset();
+
+        ReleaseCapture();
+
+        if (entry is null || ghost is null)
+        {
+            if (entry is not null)
+            {
+                entry.IsDragging = false;
+            }
+
+            ghost?.Remove();
+
+            if (commit)
+            {
+                Persist();
+            }
+
+            return;
+        }
+
+        // 落定之后才让条目显形，避免副本还在飞、原位已经出现第二个图标
+        ghost.Settle(landingCenter, () =>
+        {
+            entry.IsDragging = false;
+
+            if (commit)
+            {
+                Persist();
+            }
+        });
+    }
+
+    /// <summary>窗口关掉时把“正在拖拽”的痕迹擦干净，否则下次打开条目会是隐藏的。</summary>
+    private void ClearDragFlags()
+    {
+        foreach (AppEntry entry in _entries)
+        {
+            entry.IsDragging = false;
+        }
+    }
+
+    private void UpdateAutoScroll(Point pointerInScroller)
+    {
+        if (pointerInScroller.Y < AutoScrollEdge)
+        {
+            _autoScrollDelta = -AutoScrollStep;
+        }
+        else if (pointerInScroller.Y > GridScroller.ActualHeight - AutoScrollEdge)
+        {
+            _autoScrollDelta = AutoScrollStep;
+        }
+        else
+        {
+            _autoScrollDelta = 0;
+        }
+    }
+
+    private void AutoScrollTick()
+    {
+        if (!_dragActive || _autoScrollDelta == 0)
+        {
+            return;
+        }
+
+        double before = GridScroller.VerticalOffset;
+        double after = Math.Clamp(before + _autoScrollDelta, 0, GridScroller.ScrollableHeight);
+
+        if (Math.Abs(after - before) < 0.5)
+        {
+            return;
+        }
+
+        GridScroller.ScrollToVerticalOffset(after);
+
+        // 内容滚了，但光标在屏幕上没动 —— 相对内容的位置变了，落点要重算。
+        // 格子矩形是按内容坐标缓存的，滚动不影响它们，所以这里不用重建快照。
+        UpdateDrag(_pointerInLayer);
+    }
+
+    // ── 标题栏按钮 ──────────────────────────────────────────────
+
+    private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
+
+
+    private void OnMaximizeClick(object sender, RoutedEventArgs e) =>
+        WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
+
+    // ── 外部拖入：只处理资源管理器拖过来的文件 ──────────────────
+    //
+    // 内部排序已经改走自己的鼠标手势（见上一节），不会再进这几个回调，
+    // 所以这里不用再区分“是自己在拖还是外面拖进来”。
+
+    private void OnDragEnter(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            e.Effects = DragDropEffects.None;
+            e.Handled = true;
+            return;
+        }
+
+        DropHighlight.Visibility = Visibility.Visible;
+        e.Effects = DragDropEffects.Copy;
+        e.Handled = true;
+    }
+
+    private void OnDragOver(object sender, DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop))
+        {
+            e.Effects = DragDropEffects.None;
+            _insertIndex = -1;
+            HideInsertLine();
+            e.Handled = true;
+            return;
+        }
+
+        _insertIndex = CalculateInsertIndex(e.GetPosition(AppItems));
+        ShowInsertLine(_insertIndex);
+
+        e.Effects = DragDropEffects.Copy;
+        e.Handled = true;
+    }
+
+    private void OnDragLeave(object sender, DragEventArgs e)
+    {
+        DropHighlight.Visibility = Visibility.Collapsed;
+        HideInsertLine();
+        _insertIndex = -1;
+    }
+
+    private void OnDrop(object sender, DragEventArgs e)
+    {
+        DropHighlight.Visibility = Visibility.Collapsed;
+        HideInsertLine();
+
+        if (e.Data.GetData(DataFormats.FileDrop) is not string[] paths || paths.Length == 0)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        int index = _insertIndex < 0 ? _entries.Count : _insertIndex;
+        _insertIndex = -1;
+
+        var failures = new List<string>();
+        int inserted = 0;
+        int duplicated = 0;
+
+        foreach (string path in paths)
+        {
+            if (!ShortcutResolver.TryCreate(path, out AppEntry entry, out string error))
+            {
+                failures.Add(error);
+                continue;
+            }
+
+            if (IndexOfTarget(entry.TargetPath) >= 0)
+            {
+                duplicated++;
+                continue;
+            }
+
+            _entries.Insert(Math.Min(index + inserted, _entries.Count), entry);
+            entry.Icon = IconService.LoadOrCreate(entry);
+            inserted++;
+        }
+
+        if (inserted > 0)
+        {
+            Persist();
+            HideStatus();
+        }
+
+        if (failures.Count > 0 || duplicated > 0)
+        {
+            var parts = new List<string>();
+            if (duplicated > 0)
+            {
+                parts.Add($"{duplicated} 个已在列表中，已跳过");
+            }
+
+            parts.AddRange(failures);
+            ShowStatus(string.Join(" · ", parts));
+        }
+
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// 把第 from 个条目移动到“插入到第 insertIndex 个位置之前”。
+    /// insertIndex 是移除前的坐标，往后移时要减 1，否则会差一格。
+    /// </summary>
+    private void MoveEntry(int from, int insertIndex)
+    {
+        if (from < 0 || from >= _entries.Count || insertIndex < 0 || insertIndex > _entries.Count)
+        {
+            return;
+        }
+
+        int to = insertIndex > from ? insertIndex - 1 : insertIndex;
+        to = Math.Clamp(to, 0, _entries.Count - 1);
+
+        if (to == from)
+        {
+            return;
+        }
+
+        _entries.Move(from, to);
+        Persist();
+    }
+
+    // ── 插入位置计算 ────────────────────────────────────────────
+
+    /// <summary>外部拖入用：布局可能刚变过，先同步一次再算。</summary>
+    private int CalculateInsertIndex(Point position)
+    {
+        if (_entries.Count == 0)
+        {
+            return 0;
+        }
+
+        AppItems.UpdateLayout();
+
+        return FindInsertIndex(position, _entries.Count, GetItemBounds);
+    }
+
+    /// <summary>
+    /// 找到“拖到两个条目之间”对应的索引：先按行定位（落在某行的垂直范围内），
+    /// 再按该行的水平中点决定落在前一个还是后一个。
+    ///
+    /// 格子矩形由调用方提供：内部拖拽传缓存快照（零布局开销），
+    /// 外部拖入传实时查询（布局随时可能被窗口尺寸改掉）。
+    /// </summary>
+    private static int FindInsertIndex(Point position, int count, Func<int, Rect> rectAt)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            Rect bounds = rectAt(i);
+
+            if (bounds.IsEmpty)
+            {
+                continue;
+            }
+
+            if (position.Y < bounds.Top)
+            {
+                return i;
+            }
+
+            if (position.Y <= bounds.Bottom && position.X < bounds.Left + (bounds.Width / 2))
+            {
+                return i;
+            }
+        }
+
+        return count;
+    }
+
+    private Rect GetItemBounds(int index)
+    {
+        if (AppItems.ItemContainerGenerator.ContainerFromIndex(index) is not FrameworkElement container)
+        {
+            return Rect.Empty;
+        }
+
+        try
+        {
+            Point origin = container.TranslatePoint(new Point(0, 0), AppItems);
+            return new Rect(origin, new Size(container.ActualWidth, container.ActualHeight));
+        }
+        catch
+        {
+            return Rect.Empty;
+        }
+    }
+
+    private void ShowInsertLine(int index)
+    {
+        if (_entries.Count == 0)
+        {
+            HideInsertLine();
+            return;
+        }
+
+        double x;
+        double y;
+
+        if (index < _entries.Count)
+        {
+            Rect bounds = GetItemBounds(index);
+            if (bounds.IsEmpty)
+            {
+                HideInsertLine();
+                return;
+            }
+
+            x = bounds.Left - 5;
+            y = bounds.Top;
+        }
+        else
+        {
+            Rect bounds = GetItemBounds(_entries.Count - 1);
+            if (bounds.IsEmpty)
+            {
+                HideInsertLine();
+                return;
+            }
+
+            x = bounds.Right + 2;
+            y = bounds.Top;
+        }
+
+        try
+        {
+            Point point = AppItems.TranslatePoint(new Point(x, y), DropLayer);
+            Canvas.SetLeft(InsertLine, point.X);
+            Canvas.SetTop(InsertLine, point.Y);
+            InsertLine.Visibility = Visibility.Visible;
+        }
+        catch
+        {
+            HideInsertLine();
+        }
+    }
+
+    private void HideInsertLine() => InsertLine.Visibility = Visibility.Collapsed;
+
+    // ── 启动与菜单 ──────────────────────────────────────────────
+
+    private void LaunchEntry(AppEntry entry, bool asAdministrator)
+    {
+        // 先给确认反馈再真正启动：启动是同步调 ShellExecute，慢的时候这一下会明显“卡”
+        PlayLaunchBounce(entry);
+
+        LaunchResult result = LaunchService.TryLaunch(entry, asAdministrator, out string? error);
+
+        switch (result)
+        {
+            case LaunchResult.Started:
+                HideStatus();
+                break;
+
+            case LaunchResult.Cancelled:
+                // 用户自己取消了 UAC，不是条目的问题
+                ShowStatus($"已取消：{entry.DisplayName}");
+                break;
+
+            default:
+                entry.IsBroken = true;
+                Persist();
+                ShowStatus($"启动失败：{entry.DisplayName} — {error}");
+                break;
+        }
+    }
+
+    private static AppEntry? GetEntryFromMenu(object sender)
+    {
+        if (sender is not MenuItem item)
+        {
+            return null;
+        }
+
+        if (item.DataContext is AppEntry direct)
+        {
+            return direct;
+        }
+
+        // 兜底：沿逻辑树往上找 ContextMenu，再取 PlacementTarget
+        DependencyObject? current = item;
+        for (int depth = 0; depth < 6 && current is not null; depth++)
+        {
+            if (current is ContextMenu menu && menu.PlacementTarget is FrameworkElement target)
+            {
+                return target.DataContext as AppEntry;
+            }
+
+            current = current is FrameworkElement frameworkElement
+                ? frameworkElement.Parent ?? LogicalTreeHelper.GetParent(current)
+                : LogicalTreeHelper.GetParent(current);
+        }
+
+        return null;
+    }
+
+    private void OnMenuLaunch(object sender, RoutedEventArgs e)
+    {
+        if (GetEntryFromMenu(sender) is AppEntry entry)
+        {
+            LaunchEntry(entry, asAdministrator: false);
+        }
+    }
+
+    private void OnMenuRunAsAdmin(object sender, RoutedEventArgs e)
+    {
+        if (GetEntryFromMenu(sender) is AppEntry entry)
+        {
+            LaunchEntry(entry, asAdministrator: true);
+        }
+    }
+
+    private void OnMenuRename(object sender, RoutedEventArgs e)
+    {
+        if (GetEntryFromMenu(sender) is not AppEntry entry)
+        {
+            return;
+        }
+
+        string? name = PromptDialog.Ask(this, "重命名", entry.DisplayName);
+        if (!string.IsNullOrWhiteSpace(name) && name != entry.DisplayName)
+        {
+            entry.DisplayName = name;
+            Persist();
+        }
+    }
+
+    private void OnMenuRetarget(object sender, RoutedEventArgs e)
+    {
+        if (GetEntryFromMenu(sender) is not AppEntry entry)
+        {
+            return;
+        }
+
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "重新指定目标",
+            Filter = "程序 (*.exe;*.bat;*.cmd)|*.exe;*.bat;*.cmd|所有文件 (*.*)|*.*",
+            CheckFileExists = true,
+        };
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        entry.TargetPath = dialog.FileName;
+        entry.SourcePath = dialog.FileName;
+        entry.IconLocation = string.Empty;
+        entry.IconCachePath = string.Empty;
+        entry.WorkingDirectory = System.IO.Path.GetDirectoryName(dialog.FileName) ?? string.Empty;
+        entry.Icon = IconService.LoadOrCreate(entry);
+        entry.IsBroken = false;
+
+        Persist();
+        ShowStatus($"已重新指定：{entry.DisplayName}");
+    }
+
+    private void OnMenuReveal(object sender, RoutedEventArgs e)
+    {
+        if (GetEntryFromMenu(sender) is not AppEntry entry)
+        {
+            return;
+        }
+
+        if (!LaunchService.TryReveal(entry, out string? error) && error is not null)
+        {
+            ShowStatus($"无法打开位置：{error}");
+        }
+    }
+
+    private void OnMenuRemove(object sender, RoutedEventArgs e)
+    {
+        if (GetEntryFromMenu(sender) is not AppEntry entry)
+        {
+            return;
+        }
+
+        _entries.Remove(entry);
+        Persist();
+        ShowStatus($"已移除：{entry.DisplayName}");
+    }
+
+    // ── 辅助 ────────────────────────────────────────────────────
+
+    private int IndexOfTarget(string targetPath)
+    {
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            if (string.Equals(_entries[i].TargetPath, targetPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private void Renumber()
+    {
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            _entries[i].SortOrder = i;
+        }
+    }
+
+    private void UpdateEmptyState()
+    {
+        // 过滤激活时以“视图里还剩几个”为准，否则以主列表为准
+        bool visibleEmpty = _filterActive
+            ? CollectionViewSource.GetDefaultView(_entries).IsEmpty
+            : _entries.Count == 0;
+
+        EmptyHint.Visibility = visibleEmpty ? Visibility.Visible : Visibility.Collapsed;
+        EmptyTitle.Text = _filterActive ? "没有匹配的应用" : "把程序或快捷方式拖进来";
+        EmptySub.Text = _filterActive
+            ? "换个关键词试试，或按 Esc 清空搜索"
+            : "支持 .lnk / .url / .exe / 文件夹，可以直接拖到两个图标之间插入";
+    }
+
+    // ── 搜索过滤 ────────────────────────────────────────────────
+
+    private void OnSearchTextChanged(object sender, TextChangedEventArgs e)
+    {
+        bool empty = string.IsNullOrEmpty(SearchBox.Text);
+        SearchHint.Visibility = empty ? Visibility.Visible : Visibility.Collapsed;
+        SearchClear.Visibility = empty ? Visibility.Collapsed : Visibility.Visible;
+        ApplyFilter();
+    }
+
+    private void ApplyFilter()
+    {
+        string query = SearchBox.Text.Trim();
+        _filterActive = query.Length > 0;
+
+        ICollectionView view = CollectionViewSource.GetDefaultView(_entries);
+        view.Filter = o => !_filterActive
+            || (o is AppEntry entry
+                && entry.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase));
+
+        // 拖拽手势可能正进行到一半时清空了搜索，手势的索引体系会失效
+        if (_dragActive)
+        {
+            EndDrag(commit: false);
+        }
+
+        UpdateEmptyState();
+    }
+
+    private void OnSearchKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape)
+        {
+            if (SearchBox.Text.Length > 0)
+            {
+                SearchBox.Clear();
+            }
+
+            e.Handled = true;
+        }
+    }
+
+    private void OnSearchClearClick(object sender, RoutedEventArgs e)
+    {
+        SearchBox.Clear();
+        SearchBox.Focus();
+    }
+
+    // ── 设置 ────────────────────────────────────────────────────
+
+    private void OnSettingsClick(object sender, RoutedEventArgs e)
+    {
+        var dialog = new SettingsDialog(_settings, _ => ApplySettings()) { Owner = this };
+        dialog.ShowDialog();
+    }
+
+    /// <summary>把用户设置落到窗口上：主题、模糊半径、置顶。设置对话框每改一项就调一次。</summary>
+    private void ApplySettings()
+    {
+        bool dark = _settings.Theme switch
+        {
+            ThemeMode.Light => false,
+            ThemeMode.Dark => true,
+            _ => ThemeService.IsSystemDark(),
+        };
+
+        if (ThemeService.IsDarkMode != dark)
+        {
+            ThemeService.Apply(dark);
+        }
+
+        if (FrozenSurface.Effect is BlurEffect blur)
+        {
+            blur.Radius = _settings.BlurRadius;
+        }
+
+        Topmost = _settings.Topmost;
+
+        // 快捷键可能被改：解绑旧注册再按新配置绑（文本没变时解绑重绑也无害）
+        ApplyHotkeySetting();
+    }
+
+    private void ShowStatus(string message)
+    {
+        StatusText.Text = message;
+        StatusBar.Visibility = Visibility.Visible;
+        _statusTimer.Stop();
+        _statusTimer.Start();
+    }
+
+    private void HideStatus()
+    {
+        _statusTimer.Stop();
+        StatusBar.Visibility = Visibility.Collapsed;
+    }
+
+#if DEBUG
+    /// <summary>
+    /// 仅调试版：GLASSLAUNCHER_BACKDROP=mica|acrylic|none 覆盖材质，
+    /// 用来在同一个窗口、同一份数据上对比 Mica 与 Acrylic 的观感，不用改 XAML 重编译。
+    /// </summary>
+    private void ApplyBackdropProbe()
+    {
+        string? probe = Environment.GetEnvironmentVariable("GLASSLAUNCHER_BACKDROP");
+        if (string.IsNullOrWhiteSpace(probe))
+        {
+            return;
+        }
+
+        Backdrop = probe.Trim().ToLowerInvariant() switch
+        {
+            "mica" => GlassBackdrop.Mica,
+            "acrylic" => GlassBackdrop.Acrylic,
+            "optical" => GlassBackdrop.Optical,
+            "none" => GlassBackdrop.None,
+            _ => Backdrop,
+        };
+
+        SyncGlassMode();
+        Diag.Log($"BackdropProbe → {Backdrop}");
+    }
+
+    private void RunDebugProbes()
+    {
+        RunHoverProbe();
+        RunReorderProbe();
+        RunBrokenCheckProbe();
+        RunDragProbe();
+    }
+
+    /// <summary>
+    /// 仅调试版：GLASSLAUNCHER_DRAGPROBE="from,to" 用合成指针走一遍完整拖拽手势
+    /// （拿起 → 中间逐帧移动 → 悬停 → 落位），全程不碰真实鼠标。
+    /// 用来验证“格子让位 / 落点换算 / 落位后顺序落盘”，也方便在悬停那一刻截图看视觉。
+    /// </summary>
+    private void RunDragProbe()
+    {
+        string? probe = Environment.GetEnvironmentVariable("GLASSLAUNCHER_DRAGPROBE");
+        if (string.IsNullOrWhiteSpace(probe))
+        {
+            return;
+        }
+
+        string[] parts = probe.Split(',');
+        if (parts.Length != 2
+            || !int.TryParse(parts[0], out int from)
+            || !int.TryParse(parts[1], out int to))
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() => AnimateProbeDrag(from, to)));
+    }
+
+    private void AnimateProbeDrag(int from, int to)
+    {
+        if (from < 0 || from >= _entries.Count || to < 0 || to >= _entries.Count)
+        {
+            Diag.Log($"DragProbe 参数越界 from={from} to={to} count={_entries.Count}");
+            return;
+        }
+
+        Rect slot = GetItemBounds(from);
+        if (slot.IsEmpty)
+        {
+            Diag.Log("DragProbe 取不到条目矩形");
+            return;
+        }
+
+        var start = new Point(slot.Left + (slot.Width / 2), slot.Top + SlotShifter.IconCenterOffsetY);
+        string before = DescribeOrder();
+
+        _synthetic = true;
+        _pressedEntry = _entries[from];
+        _pressPoint = start;
+        _pointerInLayer = AppItems.TranslatePoint(start, DragLayer);
+
+        if (!BeginDrag())
+        {
+            Diag.Log("DragProbe BeginDrag 失败");
+            _pressedEntry = null;
+            return;
+        }
+
+        Point endLayer = AppItems.TranslatePoint(_slots.IconCenterAt(to), DragLayer);
+        Point originLayer = _pointerInLayer;
+
+        const int steps = 42;
+        int step = 0;
+
+        var move = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        move.Tick += (_, _) =>
+        {
+            step++;
+            double t = Math.Min(1.0, step / (double)steps);
+            double ease = 1 - Math.Pow(1 - t, 3);
+
+            _pointerInLayer = new Point(
+                originLayer.X + ((endLayer.X - originLayer.X) * ease),
+                originLayer.Y + ((endLayer.Y - originLayer.Y) * ease));
+
+            UpdateDrag(_pointerInLayer);
+
+            if (t < 1)
+            {
+                return;
+            }
+
+            move.Stop();
+            Diag.Log($"DragProbe 悬停 from={from} to={to} dragTo={_dragTo} "
+                + $"layerChildren={DragLayer.Children.Count} layerSize={DragLayer.ActualWidth}x{DragLayer.ActualHeight} "
+                + $"ghost={_ghost?.Describe() ?? "null"} "
+                + $"slotCenter={AppItems.TranslatePoint(_slots.IconCenterAt(_dragTo), DragLayer)}");
+
+            // 停在落点上，外部截图脚本正好能拍到“图标浮起 + 邻居已让位”的那一帧
+            double holdMs = double.TryParse(Environment.GetEnvironmentVariable("GLASSLAUNCHER_DRAGPROBE_HOLD"), out double ms)
+                ? ms
+                : 1600;
+            var hold = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(holdMs) };
+            hold.Tick += (_, _) =>
+            {
+                hold.Stop();
+                EndDrag(commit: true);
+                _synthetic = false;
+
+                var verify = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+                verify.Tick += (_, _) =>
+                {
+                    verify.Stop();
+                    Diag.Log($"DragProbe 完成 before=[{before}] after=[{DescribeOrder()}]");
+                };
+                verify.Start();
+            };
+            hold.Start();
+        };
+
+        move.Start();
+    }
+
+    /// <summary>
+    /// 仅调试版：GLASSLAUNCHER_REORDER="from,insertIndex"，直接走一遍 MoveEntry 并落盘，
+    /// 用来验证“往后移要减 1”的索引换算，以及 JSON 里的 SortOrder 是否正确。
+    /// </summary>
+    private void RunReorderProbe()
+    {
+        string? probe = Environment.GetEnvironmentVariable("GLASSLAUNCHER_REORDER");
+        if (string.IsNullOrWhiteSpace(probe))
+        {
+            return;
+        }
+
+        string[] parts = probe.Split(',');
+        if (parts.Length != 2
+            || !int.TryParse(parts[0], out int from)
+            || !int.TryParse(parts[1], out int insertIndex))
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            string before = DescribeOrder();
+            MoveEntry(from, insertIndex);
+            Diag.Log($"ReorderProbe from={from} insert={insertIndex} before=[{before}] after=[{DescribeOrder()}]");
+        }));
+    }
+
+    /// <summary>仅调试版：GLASSLAUNCHER_BROKEN=1 时立刻跑一次失效检测，便于在日志里看到结果。</summary>
+    private void RunBrokenCheckProbe()
+    {
+        if (Environment.GetEnvironmentVariable("GLASSLAUNCHER_BROKEN") != "1")
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(RunBrokenCheckAsync));
+    }
+
+    private string DescribeOrder() => string.Join(",", _entries.Select(e => e.DisplayName));
+
+    /// <summary>
+    /// 仅调试版：环境变量 GLASSLAUNCHER_HOVER="x,y"（相对网格左上角的 DIP 坐标），
+    /// 直接走一遍“拖拽悬停”的插入位置计算并显示指示线，用来验证位置算法。
+    /// </summary>
+    private void RunHoverProbe()
+    {
+        string? probe = Environment.GetEnvironmentVariable("GLASSLAUNCHER_HOVER");
+        if (string.IsNullOrWhiteSpace(probe))
+        {
+            return;
+        }
+
+        string[] parts = probe.Split(',');
+        if (parts.Length != 2
+            || !double.TryParse(parts[0], out double x)
+            || !double.TryParse(parts[1], out double y))
+        {
+            return;
+        }
+
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            AppItems.UpdateLayout();
+            int index = CalculateInsertIndex(new Point(x, y));
+            ShowInsertLine(index);
+            Diag.Log($"HoverProbe point=({x},{y}) insertIndex={index} count={_entries.Count}");
+        }));
+    }
+
+    /// <summary>
+    /// 仅调试版：从环境变量 GLASSLAUNCHER_SEED 读取若干路径直接入列，
+    /// 便于在没有真实拖拽的情况下验证网格与持久化。Release 版不编译这段。
+    /// </summary>
+    private void SeedFromEnvironment()
+    {
+        string? seed = Environment.GetEnvironmentVariable("GLASSLAUNCHER_SEED");
+        if (string.IsNullOrWhiteSpace(seed))
+        {
+            return;
+        }
+
+        bool added = false;
+
+        foreach (string path in seed.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (ShortcutResolver.TryCreate(path, out AppEntry entry, out string error))
+            {
+                if (IndexOfTarget(entry.TargetPath) >= 0)
+                {
+                    continue;
+                }
+
+                entry.Icon = IconService.LoadOrCreate(entry);
+                _entries.Add(entry);
+                added = true;
+            }
+            else
+            {
+                Diag.Log($"Seed 失败 {path}：{error}");
+            }
+        }
+
+        if (added)
+        {
+            Persist();
+        }
+    }
+#endif
+}

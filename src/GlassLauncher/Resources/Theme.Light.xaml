@@ -1,0 +1,162 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- 亮色（对应系统 设置 → 个性化 → 颜色 → 应用模式 = 浅色） -->
+
+    <SolidColorBrush x:Key="TextPrimaryBrush" Color="#1C1C1E" />
+    <SolidColorBrush x:Key="TextSecondaryBrush" Color="#6E6E73" />
+    <SolidColorBrush x:Key="TextTertiaryBrush" Color="#9A9A9F" />
+
+    <!--
+        玻璃分层（自下而上）：
+          背景模糊（DWM）→ WindowSheen（整体受光）→ PanelSurface（内容面板）
+          → PanelInnerShadow（面板顶部内阴影）→ 边缘折射 WindowEdge / PanelEdge → 顶部镜面高光 TopSpecular
+        全部用渐变而不是纯色：玻璃的“厚度感”来自明暗差，纯色叠出来只会像白纸。
+    -->
+
+    <!--
+        洗涤层从 65% 白降到 30%：mac 面板里壁纸的蓝是主角（实测面板色调 194,233,255），
+        白只负责把对比度拉回可读。之前 65% 白把蓝全部盖掉了，整窗发灰白。
+    -->
+    <!--
+        白纱的浓度就是“亮玻璃”和“灰板”的分界线：
+        基底固定是深色 Acrylic（颜色保真好），亮度全靠这层白。30% 时白色内容透过
+        深色基底会发闷灰（实测整窗 172,172,174）；65% 时蓝壁纸透出 (194,233,255)，
+        与 mac 实测面板色调几乎一致。之前“厚白”翻车是因为浅色基底本身还有一层
+        系统白纱，现在基底已换成深色，这里厚一点反而正确。
+    -->
+    <!--
+        白纱的浓度就是“亮玻璃”和“灰板”的分界线。基底固定深色 Acrylic（颜色保真好），
+        亮度全靠这层白：70% 时白色内容 → 240（mac 约 245），蓝壁纸 → (191,201,222)
+        （mac 实测 (194,233,255)），两边的观感都压在 mac 附近。
+        注意：这里必须配深色基底。曾经 65% 白 + 浅色基底 = 双层白纱 = 厚白板翻车；
+        浅色基底会把白内容的模糊直接顶到 250，再加白纱就什么都看不出了。
+    -->
+    <!--
+        白纱配浅色基底：基底对白内容原生 ~250，白纱 45% 只负责把整体亮度压齐
+        并给文字对比。70% 的教训见 Chrome/BackdropService.cs 里的注释 ——
+        纱太厚会把背景差异压扁，白/蓝背景看上去一个样。
+    -->
+    <SolidColorBrush x:Key="GlassWashBrush" Color="#73FAFCFF" />
+
+    <!-- 图标白底板：mac 图标自带的白色 squircle，我们替 Windows 图标补上 -->
+    <SolidColorBrush x:Key="IconPlateBrush" Color="#F2FFFFFF" />
+    <SolidColorBrush x:Key="IconPlateBorderBrush" Color="#1F000000" />
+
+    <!-- 分类药丸选中态 -->
+    <SolidColorBrush x:Key="PillSelectedBrush" Color="#66FFFFFF" />
+
+    <!-- 顶部搜索栏：mac 启动台在浅色壁纸上用深色半透明胶囊，白玻璃上压一层微暗才看得清 -->
+    <SolidColorBrush x:Key="SearchSurfaceBrush" Color="#2E000000" />
+    <SolidColorBrush x:Key="SearchBorderBrush" Color="#1F000000" />
+    <SolidColorBrush x:Key="SearchGlyphBrush" Color="#8A000000" />
+
+    <!-- 窗口整体受光：顶部偏亮、底部略带暗边 -->
+    <!--
+        通透版：整窗受光只保留一层“极薄”的白，权重从 24% 降到 14%。
+        macOS 的液态玻璃是「高透明 + 边缘折射」，靠边缘那圈亮线撑出玻璃感，
+        而不是靠整块白雾把壁纸盖掉 —— 之前那版就是在这里做厚了。
+    -->
+    <LinearGradientBrush x:Key="WindowSheenBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#17FFFFFF" Offset="0" />
+        <GradientStop Color="#0EFFFFFF" Offset="0.45" />
+        <GradientStop Color="#06FFFFFF" Offset="0.8" />
+        <GradientStop Color="#14000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 窗口边缘折射：左上受光亮、右下压暗一圈，1px 宽 -->
+    <LinearGradientBrush x:Key="WindowEdgeBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#D9FFFFFF" Offset="0" />
+        <GradientStop Color="#70FFFFFF" Offset="0.18" />
+        <GradientStop Color="#2EFFFFFF" Offset="0.5" />
+        <GradientStop Color="#1A000000" Offset="0.8" />
+        <GradientStop Color="#4D000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 顶部 1px 镜面高光：两端淡出，只在中间最亮 -->
+    <LinearGradientBrush x:Key="TopSpecularBrush" StartPoint="0,0" EndPoint="1,0">
+        <GradientStop Color="#00FFFFFF" Offset="0" />
+        <GradientStop Color="#8CFFFFFF" Offset="0.12" />
+        <GradientStop Color="#D9FFFFFF" Offset="0.5" />
+        <GradientStop Color="#8CFFFFFF" Offset="0.88" />
+        <GradientStop Color="#00FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 内容面板表面 -->
+    <!--
+        内容面板：macOS 的启动台里压根没有“内层面板”，图标是直接浮在玻璃上的。
+        这里保留一层极淡的白（4% 左右）只是为了给内容区一点层次，
+        再多就会立刻变成一块白板 —— 那正是上一版“厚白”的来源。
+    -->
+    <LinearGradientBrush x:Key="PanelSurfaceBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#08FFFFFF" Offset="0" />
+        <GradientStop Color="#05FFFFFF" Offset="0.45" />
+        <GradientStop Color="#02FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 面板描边：上亮下暗，像一块嵌进去的玻璃 -->
+    <!-- 面板描边现在是主要的“玻璃棱”：面板本身几乎透明，全靠这一圈才看得出边界 -->
+    <LinearGradientBrush x:Key="PanelEdgeBrush" StartPoint="0,0" EndPoint="1,1">
+        <GradientStop Color="#B3FFFFFF" Offset="0" />
+        <GradientStop Color="#4DFFFFFF" Offset="0.45" />
+        <GradientStop Color="#33000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 面板顶部内阴影（内容区从标题栏下方陷进去的错觉） -->
+    <LinearGradientBrush x:Key="PanelInnerShadowBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#0F000000" Offset="0" />
+        <GradientStop Color="#07000000" Offset="0.55" />
+        <GradientStop Color="#00000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 边缘内侧那道极细的暗线：外圈白高光 + 内圈暗线，才有玻璃的“湿边” -->
+    <SolidColorBrush x:Key="WindowInnerLineBrush" Color="#14000000" />
+
+    <!-- 标题栏底部的发丝分隔线：两端淡出 -->
+    <LinearGradientBrush x:Key="HeaderDividerBrush" StartPoint="0,0" EndPoint="1,0">
+        <GradientStop Color="#00000000" Offset="0" />
+        <GradientStop Color="#1C000000" Offset="0.16" />
+        <GradientStop Color="#1C000000" Offset="0.84" />
+        <GradientStop Color="#00000000" Offset="1" />
+    </LinearGradientBrush>
+
+    <!-- 兼容旧键（重命名对话框等仍在引用） -->
+    <SolidColorBrush x:Key="GlassPanelBrush" Color="#3DFFFFFF" />
+    <SolidColorBrush x:Key="GlassBorderBrush" Color="#40FFFFFF" />
+    <SolidColorBrush x:Key="GlassInnerShadowBrush" Color="#0D000000" />
+
+    <!-- Win10 Acrylic / Win11 半透明用的染色（Win11 走 Mica 时此值只影响 Acrylic 模式） -->
+    <!--
+        Acrylic 染色（含 alpha）。alpha 直接决定通透度：
+        0xB8（72%）叠上去就是一块不透明的乳白板；25% 才能透出壁纸的颜色和明暗。
+    -->
+    <Color x:Key="AcrylicTint">#40F6F7FA</Color>
+
+    <!-- 条目卡片：浅色下用白色半透明实体，靠描边勾出形状 -->
+    <SolidColorBrush x:Key="ItemTileBrush" Color="#B3FFFFFF" />
+    <SolidColorBrush x:Key="ItemTileBorderBrush" Color="#1F000000" />
+
+    <!-- 悬停：上亮下暗的玻璃片，配合 1.06 放大动画 -->
+    <LinearGradientBrush x:Key="ItemTileHoverBrush" StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#F5FFFFFF" Offset="0" />
+        <GradientStop Color="#E0FFFFFF" Offset="1" />
+    </LinearGradientBrush>
+    <SolidColorBrush x:Key="ItemHoverBorderBrush" Color="#33000000" />
+    <SolidColorBrush x:Key="ItemInitialBrush" Color="#8A8A8F" />
+
+    <!-- 右键菜单表面（需要接近不透明，否则菜单文字会透到壁纸上） -->
+    <SolidColorBrush x:Key="MenuSurfaceBrush" Color="#F7FFFFFF" />
+
+    <!-- 菜单分隔线：浅色下用黑，不能用白色描边（在白色菜单上看不见） -->
+    <SolidColorBrush x:Key="MenuSeparatorBrush" Color="#1F000000" />
+
+    <!-- 细滚动条滑块 -->
+    <SolidColorBrush x:Key="ScrollThumbBrush" Color="#4D000000" />
+
+    <!-- 失效角标 -->
+    <SolidColorBrush x:Key="WarningBrush" Color="#FFB020" />
+
+    <!-- 状态条文字（浅色下用深红，暗色下用浅红，否则读不出来） -->
+    <SolidColorBrush x:Key="WarningTextBrush" Color="#B3261E" />
+
+</ResourceDictionary>

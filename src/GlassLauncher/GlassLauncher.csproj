@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>GlassLauncher</AssemblyName>
+    <RootNamespace>GlassLauncher</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Version>0.1.0</Version>
+    <Product>Glass Launcher</Product>
+    <Company>Glass Launcher</Company>
+    <NeutralLanguage>zh-CN</NeutralLanguage>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!--
+    依赖按阶段引入，版本均已在 NuGet 上核实存在：
+      阶段 2  Lnk 1.2.0                     .lnk 纯托管解析
+
+    阶段 3 没有引入 radj307.IconExtractor：图标全部走系统 API（SHDefExtractIcon / ExtractIconEx /
+    SHGetFileInfo + SHGetImageList），零依赖，且能按索引取到 256px，见 Services/IconService.cs。
+
+    阶段 4 曾引入 gong-wpf-dragdrop 4.0.0 做网格内重排，后来移除：
+      它基于 OLE DoDragDrop，鼠标位置只能从 IDropTarget.DragOver 拿，事件频率不受控，
+      预览总是一顿一顿；每次 DragOver 还伴随一次全量布局重算；它的预览 Popup 也收不干净
+      （那个幽灵图标就是它留下的）。现在改由 MainWindow 自己接鼠标事件 + 自绘拖拽层，
+      1:1 跟手，格子用 RenderTransform 平滑让位。详见 MainWindow.xaml.cs 的拖拽章节。
+  -->
+  <ItemGroup>
+    <PackageReference Include="Lnk" Version="1.2.0" />
+    <!-- 托盘图标需要 System.Drawing.Icon（Shell_NotifyIcon 要 HICON）。
+         不开 UseWindowsForms：那会把 System.Drawing 塞进所有文件的隐式 using，
+         和 WPF 的 Point/Image/DpiChangedEventArgs 打架。只引包 + 仅 TrayIcon.cs 使用。 -->
+    <PackageReference Include="System.Drawing.Common" Version="8.0.7" />
+  </ItemGroup>
+
+  <!-- 窗口标题栏/任务栏图标（Window.Icon 走 pack URI），exe 壳图标由 ApplicationIcon 提供 -->
+  <ItemGroup>
+    <Resource Include="app.ico" />
+  </ItemGroup>
+
+</Project>

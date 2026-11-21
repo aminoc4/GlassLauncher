@@ -1,0 +1,13 @@
+# 构建产物
+[Bb]in/
+[Oo]bj/
+dist/
+*.user
+*.suo
+
+# 测试/临时
+.vs/
+*.log
+
+# 采样器输出（DEBUG 行车记录仪）
+samples/
