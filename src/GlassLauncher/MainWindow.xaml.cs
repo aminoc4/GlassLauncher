@@ -237,9 +237,38 @@ public partial class MainWindow : GlassWindow
     [System.Runtime.InteropServices.DllImport("kernel32.dll")]
     private static extern uint GetCurrentThreadId();
 
+    // ── 非模态拖动（自定义拖动，绕开 Windows 的模态移动循环）──
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct NativePoint
+    {
+        public int X;
+        public int Y;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out NativePoint point);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+
+    // Win32 的释放鼠标捕获（类里另有同名 WPF 辅助方法 ReleaseCapture，故改名；
+    // DLL 入口点仍是 ReleaseCapture）
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "ReleaseCapture")]
+    private static extern bool ReleaseWin32Capture();
+
+    private const uint SwpNosize = 0x0001;
+    private const uint SwpNozorder = 0x0004;
+    private const uint SwpNoactivate = 0x0010;
+    private const int VkLbutton = 0x01;
+
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
         const int WM_ENTERSIZEMOVE = 0x0231;
+        const int WM_NCLBUTTONDOWN = 0x00A1;
+        const int HTCAPTION = 2;
         const int WM_EXITSIZEMOVE = 0x0232;
         const int WM_HOTKEY = 0x0312;
 
@@ -259,6 +288,19 @@ public partial class MainWindow : GlassWindow
                 StopDragSamplerAfterDelay();
                 break;
 
+            case WM_NCLBUTTONDOWN:
+                // 标题区按下：不走 WindowChrome → DefWindowProc 的模态移动循环。
+                // ⚠ 这台 Windows（build 26300 Insider）上"排除开着 + 模态拖动"会让
+                // DWM 停止呈现整个窗口（拖动消失），非模态的 SetWindowPos 连续移动
+                // 走的是另一条呈现路径，实测不触发。改为手动拖动（见 StartManualDrag）。
+                if ((int)wParam == HTCAPTION && WindowState == WindowState.Normal)
+                {
+                    StartManualDrag();
+                    handled = true;
+                }
+
+                break;
+
             case WM_HOTKEY:
                 if (wParam.ToInt32() == HotkeyId)
                 {
@@ -270,6 +312,85 @@ public partial class MainWindow : GlassWindow
         }
 
         return IntPtr.Zero;
+    }
+
+    // ── 非模态（手动）拖动 ─────────────────────────────────────
+    // 模态移动循环（WM_ENTERSIZEMOVE）+ 截屏排除 = DWM 停止呈现（拖动消失），
+    // 所以标题拖动改为：拦截 WM_NCLBUTTONDOWN/HTCAPTION，用 15ms 轮询
+    // GetCursorPos + SetWindowPos 连续移动窗口（不进模态循环），live 抓屏照常。
+    private bool _manualDrag;
+    private NativePoint _manualDragCursorStart;
+    private Point _manualDragWindowStart; // 拖动开始时窗口左上角（物理 px）
+    private DispatcherTimer? _manualDragTimer;
+
+    /// <summary>
+    /// 开始手动拖动：记录起点，启动 live 背景 + 轮询计时器。
+    /// 只处理 Normal 状态（最大化时仍走系统模态路径，保持双击还原等行为）。
+    /// </summary>
+    private void StartManualDrag()
+    {
+        if (_manualDrag || WindowState != WindowState.Normal)
+        {
+            return;
+        }
+
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero || !ScreenGrab.GetWindowRect(hwnd, out ScreenGrab.Rect rect))
+        {
+            return;
+        }
+
+        if (!GetCursorPos(out _manualDragCursorStart))
+        {
+            return;
+        }
+
+        _manualDragWindowStart = new Point(rect.Left, rect.Top);
+        _manualDrag = true;
+        _inModalMove = true; // 与模态拖动一致：让 RefreezeSoon/FreezeBackdrop 让路
+        _ = ReleaseWin32Capture();
+
+        // 手动拖动没有 WM_ENTERSIZEMOVE，live 由这里直接驱动
+        StartDragRide();
+
+        _manualDragTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
+        _manualDragTimer.Tick -= ManualDragTick;
+        _manualDragTimer.Tick += ManualDragTick;
+        _manualDragTimer.Start();
+    }
+
+    private void ManualDragTick(object? sender, EventArgs e)
+    {
+        // 左键已松开 → 收尾（轮询方案不需要鼠标捕获，按键状态即真相）
+        if ((GetAsyncKeyState(VkLbutton) & 0x8000) == 0)
+        {
+            EndManualDrag();
+            return;
+        }
+
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero || !GetCursorPos(out NativePoint cursor))
+        {
+            EndManualDrag();
+            return;
+        }
+
+        int nx = (int)_manualDragWindowStart.X + cursor.X - _manualDragCursorStart.X;
+        int ny = (int)_manualDragWindowStart.Y + cursor.Y - _manualDragCursorStart.Y;
+        SetWindowPos(hwnd, IntPtr.Zero, nx, ny, 0, 0, SwpNosize | SwpNozorder | SwpNoactivate);
+    }
+
+    private void EndManualDrag()
+    {
+        if (!_manualDrag)
+        {
+            return;
+        }
+
+        _manualDrag = false;
+        _manualDragTimer?.Stop();
+        _inModalMove = false;
+        WndProc_DragEnded(); // 停 live + 立即重新锚定桌面
     }
 
     /// <summary>
@@ -748,10 +869,12 @@ public partial class MainWindow : GlassWindow
         }
         finally
         {
-            // 排除无条件关掉：静态期它必须处于关闭状态（常开+托盘 Hide/Show 会炸渲染），
-            // 拖动期更必须关闭（排除+模态拖动 = DWM 停止呈现）。即使这帧因拖动开始
-            // 而作废，也要把排除带的状态清干净
-            ScreenGrab.TrySetExclusion(hwnd, false);
+            // 抓完把排除关掉（静态期常态）。但拖动已经开始就【绝不】关 ——
+            // live 模式还指着排除抓背景，此刻关掉 = 每帧抓到自己 = 递归反馈
+            if (!_liveGrabActive && !_inModalMove)
+            {
+                ScreenGrab.TrySetExclusion(hwnd, false);
+            }
 
             _freezeBusy = false;
 
