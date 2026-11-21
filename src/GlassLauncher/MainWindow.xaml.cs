@@ -71,16 +71,40 @@ public partial class MainWindow : GlassWindow
     private const double BackdropPad = 48;
 
     // 冻结帧抓屏只在静止时跑（拖动期间让路排队），SetWindowDisplayAffinity
-    // 的开→抓→关都发生在静止状态 —— build 26300 上"排除开着进入模态拖动"
-    // 会让 DWM 停止呈现整个窗口，所以抓屏和拖动绝不同时发生
+    // 的开→抓→关不与拖动重叠
     private bool _freezeBusy;
+
+    // 排除（重新）开启的时刻（TickCount64 毫秒）。GetExclusion 只反映"开关状态"，
+    // 不反映 DWM 是否已落实 —— 刚开就抓，抓到的会混着窗口自己（鬼影帧）。
+    // FreezeBackdrop 依据它补足生效等待。
+    private long _exclusionOnTick;
+
+    // 抓帧代数：每次进入拖动递增。FreezeBackdrop 在途时（等待/抓取中）拖动开始，
+    // 在途结果作废 —— 不作废的话，一帧"拖动前位置"的过时画面会在拖动开始瞬间淡入显示
+    private int _captureGeneration;
 
     // 排除生效延迟：SetWindowDisplayAffinity 打开后 DWM 要过一两只合成帧才真正
     // 把窗口从抓屏结果里摘掉，立刻抓会把窗口自己抓进背景（模糊后就是背景鬼影）
     private const int ExclusionSettleMs = 60;
+    private const int LiveWarmupFrames = 4;
 
     // FreezeBackdrop 忙时到达的补帧请求标记：忙完必须补跑一次（旧实现直接丢弃）
     private bool _freezeQueued;
+
+    // live 背景：拖动/缩放期间每帧实抓（排除在进入模态循环时开一次、松手锚定后
+    // 由 FreezeBackdrop 收尾关掉，中间反复 BitBlt 不再开关），背景像真玻璃一样跟着桌面走。
+    // BitBlt 在 LiveGrab 的后台线程执行，UI 线程每帧只做几何提交与上屏
+    private LiveGrab? _liveGrab;
+    private bool _liveGrabActive;
+
+    // 位移预测：本帧抓的内容要等下一次合成才上屏，窗口在那之前还会移动约一帧的量。
+    // 把冻结层按上一帧的实际位移前移，抵消"背景慢半拍"的游动
+    private Point? _livePrevOrigin;
+
+    // live 拖动的帧耗时统计（松手时打一条日志；耗时为后台 BitBlt 的耗时）
+    private int _liveFrames;
+    private double _liveTotalMs;
+    private double _liveMaxMs;
 
     // 关闭动画播完的放行标记（见 Closing 拦截）
     private bool _closeAnimated;
@@ -249,30 +273,168 @@ public partial class MainWindow : GlassWindow
     }
 
     /// <summary>
-    /// 进入拖动/缩放模态循环。
+    /// 进入拖动/缩放模态循环：切 live 模式 —— 排除开一次，然后每帧 BitBlt
+    /// （CompositionTarget.Rendering 驱动），背景像真玻璃一样实时跟着桌面流动。
+    /// 排除打开失败就退回静态帧（松手后 FreezeBackdrop 补一帧）。
     ///
-    /// ⚠ 这台机器的 Windows（build 26300 Insider）上，DisplayAffinity 开启 +
-    /// 模态拖动 = DWM 停止呈现整个窗口（一拖就整个消失/变黑，松手排除关掉才回来；
-    /// 常开也一样，且松手后不恢复）。所以拖动期间【绝不】设置排除、也【绝不】抓屏：
-    /// 背景就用拖动开始前的那一帧冻结帧，让它跟着窗口走（玻璃带着自己的模糊移动），
-    /// 松手后 RefreezeSoon 重新锚定桌面。
+    /// ⚠ 消失 bug 的防线（见 RebuildDwmSurface）：托盘 Hide/Show 会把 DWM
+    /// 重定向表面留在脏状态，脏表面 + 排除开着进模态拖动 = DWM 停止呈现。
+    /// 每次唤出都重建表面洗掉脏状态，这里才敢放心开排除。
     /// </summary>
     private void StartDragRide()
     {
-        // 帧随窗动：清掉上一轮松手的回落动画，偏移归零，
-        // 冻结帧与窗口 1:1 对齐一起移动，拖动期间视觉上完全稳定
+        // 交叉淡入若正在进行，立刻定格到新帧：拖动期间不能悬着半透明的新帧层
+        CommitFrozenFade();
+
+        // 上一轮松手的回落动画清掉，偏移归零
         FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
         FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
         FrozenShift.X = 0;
         FrozenShift.Y = 0;
+
+        // 作废在途抓帧：此刻若 FreezeBackdrop 正在等待/抓取，结果作废
+        // （它抓到的是拖动前的画面，贴进来就是一帧错位）
+        _captureGeneration++;
+
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero
+            || Backdrop is GlassBackdrop.Optical or GlassBackdrop.Mica or GlassBackdrop.None)
+        {
+            return;
+        }
+
+        if (!ScreenGrab.TrySetExclusion(hwnd, true))
+        {
+            return;
+        }
+
+        _exclusionOnTick = Environment.TickCount64;
+        _liveGrab ??= new LiveGrab();
+        _liveGrab.ResetWarmup(LiveWarmupFrames);
+        _liveGrab.FrameReady -= OnLiveFrameReady;
+        _liveGrab.FrameReady += OnLiveFrameReady;
+        _liveGrabActive = true;
+        _livePrevOrigin = null;
+        _liveFrames = 0;
+        _liveTotalMs = 0;
+        _liveMaxMs = 0;
+        CompositionTarget.Rendering += OnLiveFrame;
     }
 
     private void WndProc_DragStarted() => StartDragRide();
 
+    /// <summary>
+    /// 松手：停止每帧抓屏，位移预测归零（短动画回落，避免最后一帧跳变）。
+    /// 排除【不在这里关】—— 松手后 FreezeBackdrop 立刻重抓锚定桌面，
+    /// 它发现排除已开就免等待直接抓，抓完才关（一次拖动总共只切两次排除：
+    /// 开始时开、松手锚定完关，闪烁最小化）。
+    /// </summary>
     private void WndProc_DragEnded()
     {
-        // 松手：窗口停稳了，重新锚定桌面（静止时短暂开排除抓帧是安全的）
-        RefreezeSoon();
+        if (_liveGrabActive)
+        {
+            CompositionTarget.Rendering -= OnLiveFrame;
+            _liveGrabActive = false;
+
+            // 位移预测随拖动结束而失效：最后一帧窗口已停住，背景回到零偏移
+            var settle = new DoubleAnimation(0, TimeSpan.FromMilliseconds(100))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
+            };
+            FrozenShift.BeginAnimation(TranslateTransform.XProperty, settle, HandoffBehavior.SnapshotAndReplace);
+            FrozenShift.BeginAnimation(TranslateTransform.YProperty, settle, HandoffBehavior.SnapshotAndReplace);
+
+            if (_liveFrames > 0)
+            {
+                Diag.Log($"Live drag frames={_liveFrames} avg={_liveTotalMs / _liveFrames:F1}ms max={_liveMaxMs:F1}ms");
+            }
+        }
+
+        // 立即重抓锚定（不走 120ms 防抖）：排除还开着，抓帧免等待直接抓
+        FreezeBackdrop();
+    }
+
+    /// <summary>
+    /// live 模式每帧的 UI 侧入口：只算几何并提交给后台抓帧线程（微秒级），
+    /// 绝不做任何阻塞工作 —— BitBlt 的 ~10ms 在 LiveGrab 的工作线程里，
+    /// 模态拖动循环不被堵住，窗口移动和背景更新才能同时跑满合成节拍。
+    /// </summary>
+    private void OnLiveFrame(object? sender, EventArgs e)
+    {
+        if (!_liveGrabActive)
+        {
+            return;
+        }
+
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero || ActualWidth < 40 || ActualHeight < 40)
+        {
+            return;
+        }
+
+        DpiScale dpi = VisualTreeHelper.GetDpi(this);
+        Point originPx = PointToScreen(new Point(0, 0));
+        int width = (int)Math.Ceiling((ActualWidth + BackdropPad * 2) * dpi.DpiScaleX);
+        int height = (int)Math.Ceiling((ActualHeight + BackdropPad * 2) * dpi.DpiScaleY);
+
+        _liveGrab!.Submit(
+            (int)Math.Round(originPx.X - BackdropPad * dpi.DpiScaleX),
+            (int)Math.Round(originPx.Y - BackdropPad * dpi.DpiScaleY),
+            width, height, originPx, dpi);
+    }
+
+    /// <summary>
+    /// 后台抓帧完成（UI 线程回调）：上屏 + 位移预测。
+    /// 位移预测把本帧内容按上一帧的实际位移前移，抵消上屏前窗口又移动的那一帧，
+    /// 消除"背景慢半拍"的游动感。
+    /// </summary>
+    private void OnLiveFrameReady(WriteableBitmap bitmap, Point originPx, DpiScale dpi)
+    {
+        if (!_liveGrabActive)
+        {
+            return;
+        }
+
+        FrozenSurface.Source = bitmap;
+        FrozenSurfaceAlt.Source = null;
+        FrozenSurfaceAlt.Opacity = 0;
+        FrozenBackdropHost.Visibility = Visibility.Visible;
+
+        if (_livePrevOrigin is Point prev)
+        {
+            FrozenShift.X = (originPx.X - prev.X) / dpi.DpiScaleX;
+            FrozenShift.Y = (originPx.Y - prev.Y) / dpi.DpiScaleY;
+        }
+
+        _livePrevOrigin = originPx;
+
+        double ms = _liveGrab!.LastGrabMs;
+        _liveFrames++;
+        _liveTotalMs += ms;
+        _liveMaxMs = Math.Max(_liveMaxMs, ms);
+    }
+
+    /// <summary>
+    /// 强制 DWM 重建本窗口的重定向表面：连续开关一次截屏排除。
+    ///
+    /// 为什么要做：托盘 Hide()/Show() 循环会把窗口的 DWM 表面留在"脏"状态 ——
+    /// 脏表面 + 排除开着进入模态拖动 = DWM 停止呈现整个窗口（一拖整个消失，
+    /// 松手排除关掉才回来；v0.1 没有 Hide/Show 所以从不出事）。
+    /// 开关排除正好是已知能强制 DWM 重建表面的手段（它也是"闪烁"的来源 ——
+    /// 所以必须趁唤出的淡入动画期间做，窗口本来就半透明，重建视觉上不可见）。
+    /// </summary>
+    private void RebuildDwmSurface()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero)
+        {
+            return;
+        }
+
+        bool wasExcluded = ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE;
+        ScreenGrab.TrySetExclusion(hwnd, !wasExcluded);
+        ScreenGrab.TrySetExclusion(hwnd, wasExcluded);
+        Diag.Log("dwm surface rebuilt");
     }
 
     public MainWindow()
@@ -482,13 +644,16 @@ public partial class MainWindow : GlassWindow
     /// 唯一出路是干脆不让 DWM 的模糊露脸：抓一帧真实背景（截屏排除保证抓到的是
     /// "我们盖住的那片"，不是我们自己），GPU 高斯模糊后全程盖在上面。
     ///
-    /// 抓屏时机：启动后第一帧（Loaded）+ 程序化尺寸/位置变化（防抖）+ 松手重新锚定。
-    /// 只在【静止】时抓 —— 开→抓→关整个发生在静止状态；
-    /// 拖动/缩放期间绝不碰 DisplayAffinity（build 26300 上排除开着进模态拖动 =
-    /// DWM 停止呈现窗口：一拖就整个消失/变黑，松手才回来），拖动期间帧随窗动。
+    /// 抓屏时机：启动后第一帧（Loaded）+ 松手锚定（WndProc_DragEnded）+
+    /// 程序化尺寸/位置变化（防抖）。只在【静止】时抓。
     ///
-    /// 异步的原因：SetWindowDisplayAffinity 打开后 DWM 要过一两只合成帧才真正落实排除，
-    /// 同步抓会把窗口自己抓进背景（背景里出现自己图标的模糊鬼影）。等 60ms 再抓。
+    /// 排除开关策略（关键，直接影响"闪一下"）：静态期排除常开（OnSourceInitialized
+    /// 设一次），所以这里大多数时候【零切换】直接抓 —— 每次开关都是一次 DWM 表面
+    /// 重建，用户看到的就是整窗闪一下。只有松手路径（拖动中关过）才需要开一次。
+    /// 抓完【不关】，保持开启直到下一次拖动。
+    ///
+    /// 排除刚开时要等 60ms（DWM 过一两只合成帧才真正落实排除，立刻抓会把窗口自己
+    /// 抓进背景）。已常开时无需等待。
     /// </summary>
     private async void FreezeBackdrop()
     {
@@ -507,15 +672,13 @@ public partial class MainWindow : GlassWindow
         if (_freezeBusy)
         {
             // 忙时不能丢请求：记一次，当前帧抓完用【新位置】补跑。
-            // 之前直接 return —— 等待期间窗口被移动时到达的补帧会被吞掉，
-            // 冻结帧就永远停在旧位置（背景整体错位的来源之一）
             _freezeQueued = true;
             return;
         }
 
         if (_inModalMove)
         {
-            // 拖动期间冻结帧让路：抓屏+排除绝不能发生在模态拖动里
+            // 拖动期间冻结帧让路：抓屏不能发生在模态拖动里
             _freezeQueued = true;
             return;
         }
@@ -524,63 +687,127 @@ public partial class MainWindow : GlassWindow
 
         try
         {
-            if (!ScreenGrab.TrySetExclusion(hwnd, true))
+            bool exclusionReady = ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE;
+
+            if (!exclusionReady)
             {
-                return;
-            }
-
-            try
-            {
-                // 等待期间窗口可能在移动（LocationChanged 还会再触发防抖），
-                // 所以位置/DPI/尺寸必须全部在等待【之后】读
-                await Task.Delay(ExclusionSettleMs);
-
-                DpiScale dpi = VisualTreeHelper.GetDpi(this);
-                Point origin = PointToScreen(new Point(0, 0));
-                // 与显示端同套几何：抓屏区域比窗口四周各大 BackdropPad，
-                // 显示端 Margin=-48 + Stretch=Fill 恰好 1:1 映射，背景与桌面像素级对齐
-                int width = (int)Math.Ceiling((ActualWidth + BackdropPad * 2) * dpi.DpiScaleX);
-                int height = (int)Math.Ceiling((ActualHeight + BackdropPad * 2) * dpi.DpiScaleY);
-
-                byte[]? pixels = ScreenGrab.Capture(
-                    (int)Math.Round(origin.X - BackdropPad * dpi.DpiScaleX),
-                    (int)Math.Round(origin.Y - BackdropPad * dpi.DpiScaleY),
-                    width, height);
-
-                if (pixels is null)
+                if (!ScreenGrab.TrySetExclusion(hwnd, true))
                 {
                     return;
                 }
 
-                var bitmap = new WriteableBitmap(width, height, dpi.DpiScaleX * 96, dpi.DpiScaleY * 96,
-                    PixelFormats.Bgra32, null);
-                bitmap.WritePixels(new Int32Rect(0, 0, width, height), pixels, width * 4, 0);
+                _exclusionOnTick = Environment.TickCount64;
+            }
 
-                // 静态帧没有位移预测，偏移必须归零（上一轮的回落动画可能还没走完）
-                FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
-                FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
-                FrozenShift.X = 0;
-                FrozenShift.Y = 0;
-                FrozenSurface.Source = bitmap;
-                FrozenBackdropHost.Visibility = Visibility.Visible;
-            }
-            finally
+            // 排除刚（重）开的话，DWM 要过一两只合成帧才真正落实，补足等待。
+            // 只看开关状态就抓 = 把窗口自己抓进背景（鬼影帧）。
+            // 松手路径上排除从拖动开始就一直开着，elapsed 远超 60ms，这里零等待直接抓。
+            long sinceOn = Environment.TickCount64 - _exclusionOnTick;
+            if (sinceOn < ExclusionSettleMs)
             {
-                // 抓完立刻放开：用户正常截图/录屏时窗口必须可见
-                ScreenGrab.TrySetExclusion(hwnd, false);
+                await Task.Delay((int)(ExclusionSettleMs - sinceOn));
             }
+
+            int generation = _captureGeneration;
+
+            DpiScale dpi = VisualTreeHelper.GetDpi(this);
+            Point origin = PointToScreen(new Point(0, 0));
+            // 与显示端同套几何：抓屏区域比窗口四周各大 BackdropPad，
+            // 显示端 Margin=-48 + Stretch=Fill 恰好 1:1 映射，背景与桌面像素级对齐
+            int width = (int)Math.Ceiling((ActualWidth + BackdropPad * 2) * dpi.DpiScaleX);
+            int height = (int)Math.Ceiling((ActualHeight + BackdropPad * 2) * dpi.DpiScaleY);
+
+            byte[]? pixels = ScreenGrab.Capture(
+                (int)Math.Round(origin.X - BackdropPad * dpi.DpiScaleX),
+                (int)Math.Round(origin.Y - BackdropPad * dpi.DpiScaleY),
+                width, height);
+
+            if (pixels is null)
+            {
+                return;
+            }
+
+            if (generation != _captureGeneration)
+            {
+                // 等待/抓取期间拖动开始了：这帧作废（位置是拖动前的过时画面）
+                Diag.Log("freeze result discarded (drag started mid-capture)");
+                return;
+            }
+
+            var bitmap = new WriteableBitmap(width, height, dpi.DpiScaleX * 96, dpi.DpiScaleY * 96,
+                PixelFormats.Bgra32, null);
+            bitmap.WritePixels(new Int32Rect(0, 0, width, height), pixels, width * 4, 0);
+
+            // 静态帧没有位移预测，偏移必须归零（live 松手的回落动画可能还没走完）
+            FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+            FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+            FrozenShift.X = 0;
+            FrozenShift.Y = 0;
+
+            ShowFrozenFrame(bitmap);
         }
         finally
         {
+            // 排除无条件关掉：静态期它必须处于关闭状态（常开+托盘 Hide/Show 会炸渲染），
+            // 拖动期更必须关闭（排除+模态拖动 = DWM 停止呈现）。即使这帧因拖动开始
+            // 而作废，也要把排除带的状态清干净
+            ScreenGrab.TrySetExclusion(hwnd, false);
+
             _freezeBusy = false;
 
             // 排队的那次补跑：此刻窗口已停稳，用最新位置抓
             if (_freezeQueued)
             {
                 _freezeQueued = false;
-                Dispatcher.BeginInvoke(FreezeBackdrop, DispatcherPriority.Loaded);
+                _ = Dispatcher.BeginInvoke(DispatcherPriority.Loaded, (Action)FreezeBackdrop);
             }
         }
+    }
+
+    /// <summary>
+    /// 把新冻结帧上屏。已有一帧时不硬切（背景内容突变 = "松手闪一下"），改为交叉淡入：
+    /// 新帧放到 FrozenSurfaceAlt 上从 0 淡入到 1，完成后换到底层的 Source、清空淡入层。
+    /// 首帧（底下还没有内容）直接上，没有可淡入的对象。
+    /// </summary>
+    private void ShowFrozenFrame(WriteableBitmap bitmap)
+    {
+        if (FrozenBackdropHost.Visibility != Visibility.Visible || FrozenSurface.Source is null)
+        {
+            FrozenSurface.Source = bitmap;
+            FrozenSurfaceAlt.Source = null;
+            FrozenSurfaceAlt.Opacity = 0;
+            FrozenBackdropHost.Visibility = Visibility.Visible;
+            return;
+        }
+
+        // 上一轮淡入还没结束又来了新帧：先定格上一轮，再从当前底帧重新淡入
+        CommitFrozenFade();
+
+        FrozenSurfaceAlt.Source = bitmap;
+
+        var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180))
+        {
+            EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut },
+        };
+        fade.Completed += (_, _) => CommitFrozenFade();
+        FrozenSurfaceAlt.BeginAnimation(OpacityProperty, fade, HandoffBehavior.SnapshotAndReplace);
+    }
+
+    /// <summary>
+    /// 把淡入层定格到底层：alt 的内容交给主层，alt 清空归零。
+    /// 拖动开始、新一轮淡入开始、淡入完成时都要走一遍。
+    /// </summary>
+    private void CommitFrozenFade()
+    {
+        FrozenSurfaceAlt.BeginAnimation(OpacityProperty, null);
+
+        if (FrozenSurfaceAlt.Source is not null)
+        {
+            FrozenSurface.Source = FrozenSurfaceAlt.Source;
+            FrozenSurfaceAlt.Source = null;
+        }
+
+        FrozenSurfaceAlt.Opacity = 0;
     }
 
     // ── 托盘常驻 ────────────────────────────────────────────────
@@ -872,6 +1099,10 @@ public partial class MainWindow : GlassWindow
         Show();
         EnsureOnScreen();
         ForceForeground();
+
+        // 洗掉 Hide/Show 留下的脏 DWM 表面（消失 bug 的毒源，见 RebuildDwmSurface）。
+        // 趁下面 300ms 淡入动画窗口还半透明时做，表面重建视觉上不可见
+        Dispatcher.BeginInvoke(RebuildDwmSurface, DispatcherPriority.Loaded);
 
         var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
         var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(300)) { EasingFunction = ease };
@@ -2046,9 +2277,15 @@ public partial class MainWindow : GlassWindow
             ThemeService.Apply(dark);
         }
 
+        // 两个冻结层（底帧 + 交叉淡入层）各持一份 BlurEffect，浓度要同步改
         if (FrozenSurface.Effect is BlurEffect blur)
         {
             blur.Radius = _settings.BlurRadius;
+        }
+
+        if (FrozenSurfaceAlt.Effect is BlurEffect blurAlt)
+        {
+            blurAlt.Radius = _settings.BlurRadius;
         }
 
         Topmost = _settings.Topmost;

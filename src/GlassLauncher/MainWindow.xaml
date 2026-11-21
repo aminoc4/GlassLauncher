@@ -49,9 +49,8 @@
             失焦退化成不透明的灰板（系统规则），聚焦态的实时模糊又浓得糊成一坨（同样不可调）。
             所以聚焦和失焦统一走这一层：抓一帧真实背景（截屏排除保证抓到的不是自己），
             GPU 高斯模糊后盖在上面。
-            窗口拖动/缩放期间切 live 模式：每帧重抓（排除只开一次不反复开关），
-            背景像真玻璃一样跟着桌面流动，而不是一幅贴在窗口上的静态图；
-            松手后冻结在最后一帧。抓屏时机见 MainWindow.xaml.cs 的注释。
+            拖动期间不抓屏（build 26300 上排除+拖动 = DWM 停止呈现窗口），
+            用拖动前的冻结帧随窗移动，松手后重新锚定桌面。抓屏时机见 MainWindow.xaml.cs 的注释。
         -->
         <Grid x:Name="FrozenBackdropHost"
               IsHitTestVisible="False"
@@ -71,6 +70,21 @@
                 </Image.RenderTransform>
                 <Image.Effect>
                     <!-- 半径 12：用户验收的浓度。DWM 的实时模糊已不参与显示，这个值就是唯一的模糊来源 -->
+                    <BlurEffect Radius="12" KernelType="Gaussian" />
+                </Image.Effect>
+            </Image>
+            <!--
+                交叉淡入的"新帧层"：松手重新锚定时新背景从它上面淡入，
+                完成后换到 FrozenSurface 底上。避免新旧帧硬切造成的背景跳变。
+                与 FrozenSurface 同几何（Margin/Stretch/模糊），只是没有位移变换 ——
+                淡入只发生在静止状态，不需要位移预测。
+            -->
+            <Image x:Name="FrozenSurfaceAlt"
+                   Margin="-48"
+                   Stretch="Fill"
+                   Opacity="0"
+                   RenderOptions.BitmapScalingMode="LowQuality">
+                <Image.Effect>
                     <BlurEffect Radius="12" KernelType="Gaussian" />
                 </Image.Effect>
             </Image>
