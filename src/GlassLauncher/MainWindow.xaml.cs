@@ -79,6 +79,10 @@ public partial class MainWindow : GlassWindow
     // FreezeBackdrop 依据它补足生效等待。
     private long _exclusionOnTick;
 
+    // 截屏排除是否处于"常开"状态（永久排除策略：启动即开，只有模态循环临时关）。
+    // 常开时抓帧零切换零等待；异常掉开过才需要重开 + 预热
+    private bool _exclusionHeld;
+
     // 抓帧代数：每次进入拖动递增。FreezeBackdrop 在途时（等待/抓取中）拖动开始，
     // 在途结果作废 —— 不作废的话，一帧"拖动前位置"的过时画面会在拖动开始瞬间淡入显示
     private int _captureGeneration;
@@ -90,6 +94,7 @@ public partial class MainWindow : GlassWindow
 
     // FreezeBackdrop 忙时到达的补帧请求标记：忙完必须补跑一次（旧实现直接丢弃）
     private bool _freezeQueued;
+    private bool _freezeQueuedInstant;
 
     // live 背景：拖动/缩放期间每帧实抓（排除在进入模态循环时开一次、松手锚定后
     // 由 FreezeBackdrop 收尾关掉，中间反复 BitBlt 不再开关），背景像真玻璃一样跟着桌面走。
@@ -158,6 +163,19 @@ public partial class MainWindow : GlassWindow
 
         InitTray();
         ApplyHotkeySetting();
+
+        // 截屏排除永久常开（启动时设一次，之后全生命周期不再切换）。
+        // 每次开关都是一次 DWM 表面重建 = 一次整窗闪烁 —— 常开后全链路零切换：
+        //   · 抓帧（静态/松手锚定）：零切换直接抓；
+        //   · 标题拖动：非模态自定义拖动（见 WM_NCLBUTTONDOWN），排除开着 + 非模态
+        //     移动实测不会触发 DWM 停止呈现（消失 bug 只咬模态循环）；
+        //   · 缩放边缘（WM_ENTERSIZEMOVE 模态循环）：例外 —— 进循环前临时关掉、
+        //     出循环恢复（见 WndProc_DragStarted / DragEnded）。
+        // 代价：用户自己的截图/录屏里没有本窗口（对启动器可接受）。
+        IntPtr hwndExclusion = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        _exclusionHeld = hwndExclusion != IntPtr.Zero && ScreenGrab.TrySetExclusion(hwndExclusion, true);
+        _exclusionOnTick = Environment.TickCount64;
+        Diag.Log($"permanent exclusion held={_exclusionHeld}");
     }
 
     private void InitTray()
@@ -390,17 +408,47 @@ public partial class MainWindow : GlassWindow
         _manualDrag = false;
         _manualDragTimer?.Stop();
         _inModalMove = false;
-        WndProc_DragEnded(); // 停 live + 立即重新锚定桌面
+
+        // 停 live。松手的视觉连续性靠"精确对齐 + 原子换帧"，绝不能加动画：
+        //  - 最后一帧 live 帧带着预测偏移（拖动中每帧的位移量，可达十几像素），
+        //    任何"回落到 0"的动画都会把已对齐的背景推歪 —— 那本身就是闪烁；
+        //  - 静态帧几毫秒后就到，中途动画必然被硬杀，等于自己制造一次跳变。
+        if (_liveGrabActive)
+        {
+            CompositionTarget.Rendering -= OnLiveFrame;
+            _liveGrabActive = false;
+
+            // 精确对齐：窗口已停，用真实终点重算最后一帧的偏移
+            // （拖动中偏移是"预测值" s ≈ (O_n - O_{n-1})，正确值是 (O_c - W)）。
+            // 修正后最后一帧与桌面像素级重合；随后静态帧（偏移恒 0）原子替换，
+            // 两个状态完全一样 —— 松手零闪烁。锚定推导：内容抓于 O_c、以偏移 s
+            // 显示在窗口 W 上时，屏幕对齐条件为 s = (O_c - W) / dpi。
+            IntPtr hwndEnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (_livePrevOrigin is Point lastOrigin && hwndEnd != IntPtr.Zero
+                && ScreenGrab.GetWindowRect(hwndEnd, out ScreenGrab.Rect endRect))
+            {
+                DpiScale dpiEnd = VisualTreeHelper.GetDpi(this);
+                FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+                FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+                FrozenShift.X = (lastOrigin.X - endRect.Left) / dpiEnd.DpiScaleX;
+                FrozenShift.Y = (lastOrigin.Y - endRect.Top) / dpiEnd.DpiScaleY;
+                Diag.Log($"drag end align dx={FrozenShift.X:F1} dy={FrozenShift.Y:F1}");
+            }
+
+            if (_liveFrames > 0)
+            {
+                Diag.Log($"Live drag frames={_liveFrames} avg={_liveTotalMs / _liveFrames:F1}ms max={_liveMaxMs:F1}ms");
+            }
+        }
+
+        // 立即重新锚定桌面（排除常开，抓帧零切换零等待；instant=直接换帧不走淡入）
+        FreezeBackdrop(instant: true);
     }
 
     /// <summary>
-    /// 进入拖动/缩放模态循环：切 live 模式 —— 排除开一次，然后每帧 BitBlt
-    /// （CompositionTarget.Rendering 驱动），背景像真玻璃一样实时跟着桌面流动。
-    /// 排除打开失败就退回静态帧（松手后 FreezeBackdrop 补一帧）。
-    ///
-    /// ⚠ 消失 bug 的防线（见 RebuildDwmSurface）：托盘 Hide/Show 会把 DWM
-    /// 重定向表面留在脏状态，脏表面 + 排除开着进模态拖动 = DWM 停止呈现。
-    /// 每次唤出都重建表面洗掉脏状态，这里才敢放心开排除。
+    /// 手动（非模态）拖动开始：启动 live 抓屏，背景实时跟着桌面流动。
+    /// 排除永久常开（见 OnSourceInitialized），这里零切换零预热直接开抓 ——
+    /// 非模态移动 + 排除开着实测不会触发 DWM 停止呈现（消失 bug 只咬模态循环）。
     /// </summary>
     private void StartDragRide()
     {
@@ -424,14 +472,22 @@ public partial class MainWindow : GlassWindow
             return;
         }
 
-        if (!ScreenGrab.TrySetExclusion(hwnd, true))
+        // 排除永久常开：已开就零切换零预热直接抓；只有异常掉开过才需要重开+预热
+        bool exclusionFresh = false;
+        if (!_exclusionHeld)
         {
-            return;
+            if (!ScreenGrab.TrySetExclusion(hwnd, true))
+            {
+                return;
+            }
+
+            _exclusionHeld = true;
+            _exclusionOnTick = Environment.TickCount64;
+            exclusionFresh = true;
         }
 
-        _exclusionOnTick = Environment.TickCount64;
         _liveGrab ??= new LiveGrab();
-        _liveGrab.ResetWarmup(LiveWarmupFrames);
+        _liveGrab.ResetWarmup(exclusionFresh ? LiveWarmupFrames : 0);
         _liveGrab.FrameReady -= OnLiveFrameReady;
         _liveGrab.FrameReady += OnLiveFrameReady;
         _liveGrabActive = true;
@@ -442,36 +498,58 @@ public partial class MainWindow : GlassWindow
         CompositionTarget.Rendering += OnLiveFrame;
     }
 
-    private void WndProc_DragStarted() => StartDragRide();
-
     /// <summary>
-    /// 松手：停止每帧抓屏，位移预测归零（短动画回落，避免最后一帧跳变）。
-    /// 排除【不在这里关】—— 松手后 FreezeBackdrop 立刻重抓锚定桌面，
-    /// 它发现排除已开就免等待直接抓，抓完才关（一次拖动总共只切两次排除：
-    /// 开始时开、松手锚定完关，闪烁最小化）。
+    /// 进入模态循环（只剩缩放边缘 / 最大化拖动会走到这 —— 标题拖动已被手动拖动
+    /// 拦截，见 WM_NCLBUTTONDOWN）。
+    ///
+    /// ⚠ 模态循环 + 排除开着 = DWM 停止呈现窗口（拖动消失，这台 build 26300 的
+    /// 系统级故障）。所以进模态循环的第一件事是把排除临时关掉，冻结帧随窗动，
+    /// 出循环（DragEnded）再把排除恢复常开。
     /// </summary>
-    private void WndProc_DragEnded()
+    private void WndProc_DragStarted()
     {
-        if (_liveGrabActive)
+        // 交叉淡入若正在进行，立刻定格到新帧
+        CommitFrozenFade();
+
+        // 帧随窗动：偏移归零，冻结帧与窗口 1:1 对齐一起移动
+        FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+        FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+        FrozenShift.X = 0;
+        FrozenShift.Y = 0;
+
+        // 作废在途抓帧
+        _captureGeneration++;
+
+        if (_exclusionHeld)
         {
-            CompositionTarget.Rendering -= OnLiveFrame;
-            _liveGrabActive = false;
-
-            // 位移预测随拖动结束而失效：最后一帧窗口已停住，背景回到零偏移
-            var settle = new DoubleAnimation(0, TimeSpan.FromMilliseconds(100))
+            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+            if (hwnd != IntPtr.Zero)
             {
-                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut },
-            };
-            FrozenShift.BeginAnimation(TranslateTransform.XProperty, settle, HandoffBehavior.SnapshotAndReplace);
-            FrozenShift.BeginAnimation(TranslateTransform.YProperty, settle, HandoffBehavior.SnapshotAndReplace);
-
-            if (_liveFrames > 0)
-            {
-                Diag.Log($"Live drag frames={_liveFrames} avg={_liveTotalMs / _liveFrames:F1}ms max={_liveMaxMs:F1}ms");
+                ScreenGrab.TrySetExclusion(hwnd, false);
+                _exclusionHeld = false;
             }
         }
 
-        // 立即重抓锚定（不走 120ms 防抖）：排除还开着，抓帧免等待直接抓
+        // 不开 live：模态循环里排除必须关，而抓屏依赖排除 —— 冻结帧顶上
+    }
+
+    /// <summary>
+    /// 模态循环结束（缩放/最大化拖动松手）：排除恢复常开，然后立即重新锚定桌面。
+    /// 手动拖动的收尾不走这里（EndManualDrag 直接调 FreezeBackdrop —— 排除
+    /// 全程常开，一次都不用切）。
+    /// </summary>
+    private void WndProc_DragEnded()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (!_exclusionHeld && hwnd != IntPtr.Zero)
+        {
+            ScreenGrab.TrySetExclusion(hwnd, true);
+            _exclusionHeld = true;
+            _exclusionOnTick = Environment.TickCount64;
+        }
+
+        // 立即重抓锚定（不走 120ms 防抖）。排除刚恢复的话 FreezeBackdrop
+        // 会按 _exclusionOnTick 补足生效等待
         FreezeBackdrop();
     }
 
@@ -765,8 +843,13 @@ public partial class MainWindow : GlassWindow
     /// 唯一出路是干脆不让 DWM 的模糊露脸：抓一帧真实背景（截屏排除保证抓到的是
     /// "我们盖住的那片"，不是我们自己），GPU 高斯模糊后全程盖在上面。
     ///
-    /// 抓屏时机：启动后第一帧（Loaded）+ 松手锚定（WndProc_DragEnded）+
-    /// 程序化尺寸/位置变化（防抖）。只在【静止】时抓。
+    /// 抓屏时机：启动后第一帧（Loaded）+ 松手锚定（EndManualDrag /
+    /// WndProc_DragEnded）+ 程序化尺寸/位置变化（防抖）。只在【静止】时抓。
+    ///
+    /// instant：松手（live 刚停）路径专用。此刻底上显示的就是实时桌面（已精确
+    /// 对齐），静态帧与它完全重合 —— 直接换 Source，交叉淡入反而是错位重影
+    /// （"失焦闪一下"的元凶）。其余路径（托盘唤出、尺寸变化、模态松手）底下
+    /// 的帧是过时的，仍走淡入。
     ///
     /// 排除开关策略（关键，直接影响"闪一下"）：静态期排除常开（OnSourceInitialized
     /// 设一次），所以这里大多数时候【零切换】直接抓 —— 每次开关都是一次 DWM 表面
@@ -776,7 +859,7 @@ public partial class MainWindow : GlassWindow
     /// 排除刚开时要等 60ms（DWM 过一两只合成帧才真正落实排除，立刻抓会把窗口自己
     /// 抓进背景）。已常开时无需等待。
     /// </summary>
-    private async void FreezeBackdrop()
+    private async void FreezeBackdrop(bool instant = false)
     {
         // 光学模式自己就是真背景；Mica 失焦不退化；没有基底更不用管
         if (Backdrop is GlassBackdrop.Optical or GlassBackdrop.Mica or GlassBackdrop.None)
@@ -792,8 +875,9 @@ public partial class MainWindow : GlassWindow
 
         if (_freezeBusy)
         {
-            // 忙时不能丢请求：记一次，当前帧抓完用【新位置】补跑。
+            // 忙时不能丢请求：记一次，当前帧抓完用【新位置】补跑（instant 一并保留）
             _freezeQueued = true;
+            _freezeQueuedInstant |= instant;
             return;
         }
 
@@ -801,6 +885,7 @@ public partial class MainWindow : GlassWindow
         {
             // 拖动期间冻结帧让路：抓屏不能发生在模态拖动里
             _freezeQueued = true;
+            _freezeQueuedInstant |= instant;
             return;
         }
 
@@ -865,40 +950,40 @@ public partial class MainWindow : GlassWindow
             FrozenShift.X = 0;
             FrozenShift.Y = 0;
 
-            ShowFrozenFrame(bitmap);
+            ShowFrozenFrame(bitmap, instant);
         }
         finally
         {
-            // 抓完把排除关掉（静态期常态）。但拖动已经开始就【绝不】关 ——
-            // live 模式还指着排除抓背景，此刻关掉 = 每帧抓到自己 = 递归反馈
-            if (!_liveGrabActive && !_inModalMove)
-            {
-                ScreenGrab.TrySetExclusion(hwnd, false);
-            }
+            // 排除永久常开：抓完不关（每次开关 = 一次表面重建 = 一次整窗闪烁）。
+            // 唯一的例外是模态循环（缩放/最大化拖动），由 WndProc_DragStarted/DragEnded 管理
 
             _freezeBusy = false;
 
-            // 排队的那次补跑：此刻窗口已停稳，用最新位置抓
+            // 排队的那次补跑：此刻窗口已停稳，用最新位置抓（instant 标志一并带回）
             if (_freezeQueued)
             {
                 _freezeQueued = false;
-                _ = Dispatcher.BeginInvoke(DispatcherPriority.Loaded, (Action)FreezeBackdrop);
+                bool queuedInstant = _freezeQueuedInstant;
+                _freezeQueuedInstant = false;
+                _ = Dispatcher.BeginInvoke(DispatcherPriority.Loaded,
+                    (Action)(() => FreezeBackdrop(queuedInstant)));
             }
         }
     }
 
     /// <summary>
-    /// 把新冻结帧上屏。已有一帧时不硬切（背景内容突变 = "松手闪一下"），改为交叉淡入：
-    /// 新帧放到 FrozenSurfaceAlt 上从 0 淡入到 1，完成后换到底层的 Source、清空淡入层。
-    /// 首帧（底下还没有内容）直接上，没有可淡入的对象。
+    /// 把新冻结帧上屏。instant（松手路径）：底上的 live 帧已与新帧重合，直接换
+    /// Source，零动画。否则交叉淡入：新帧放到 FrozenSurfaceAlt 上从 0 淡入到 1，
+    /// 完成后换到底层的 Source、清空淡入层。首帧（底下还没有内容）直接上。
     /// </summary>
-    private void ShowFrozenFrame(WriteableBitmap bitmap)
+    private void ShowFrozenFrame(WriteableBitmap bitmap, bool instant = false)
     {
-        if (FrozenBackdropHost.Visibility != Visibility.Visible || FrozenSurface.Source is null)
+        if (instant || FrozenBackdropHost.Visibility != Visibility.Visible || FrozenSurface.Source is null)
         {
+            // 在途淡入先定格（杀动画、归并内容），再直接换帧 —— 任何残留动画
+            // 都会在下一拍把 Opacity 改回去，造成闪层
+            CommitFrozenFade();
             FrozenSurface.Source = bitmap;
-            FrozenSurfaceAlt.Source = null;
-            FrozenSurfaceAlt.Opacity = 0;
             FrozenBackdropHost.Visibility = Visibility.Visible;
             return;
         }
