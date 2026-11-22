@@ -853,8 +853,30 @@ void LauncherApp::Paint()
 
     renderer_.FillRect(D2D1::RectF(0, 0, widthDip_, heightDip_), colors_.wash);
 
-    D2D1_RECT_F panel = D2D1::RectF(PanelMargin, 0.0f, widthDip_ - PanelMargin, heightDip_);
-    renderer_.FillRoundRect(panel, 16.0f, colors_.panelSurface);
+    // WindowSheen：整窗受光层（亮色刷白、暗色压暗），与 WPF 的 WindowSheenBrush 同款纵向渐变。
+    // 之前暗色用 40% 纯黑整层铺，窗口比桌面明显暗一档，边缘就现出"界线两侧色差"。
+    if (dark_)
+    {
+        D2D1_GRADIENT_STOP sheen[3] = {
+            {0.0f, D2D1::ColorF(0x23 / 255.0f, 0x25 / 255.0f, 0x29 / 255.0f, 0x2E / 255.0f)},
+            {0.45f, D2D1::ColorF(0x1E / 255.0f, 0x20 / 255.0f, 0x24 / 255.0f, 0x38 / 255.0f)},
+            {1.0f, D2D1::ColorF(0x19 / 255.0f, 0x1B / 255.0f, 0x1E / 255.0f, 0x42 / 255.0f)},
+        };
+        renderer_.FillRectGradient(D2D1::RectF(0, 0, widthDip_, heightDip_), sheen, 3, false);
+    }
+    else
+    {
+        D2D1_GRADIENT_STOP sheen[4] = {
+            {0.0f, D2D1::ColorF(1, 1, 1, 0x17 / 255.0f)},
+            {0.45f, D2D1::ColorF(1, 1, 1, 0x0E / 255.0f)},
+            {0.8f, D2D1::ColorF(1, 1, 1, 0x06 / 255.0f)},
+            {1.0f, D2D1::ColorF(0, 0, 0, 0x14 / 255.0f)},
+        };
+        renderer_.FillRectGradient(D2D1::RectF(0, 0, widthDip_, heightDip_), sheen, 4, false);
+    }
+
+    // 面板内表层去掉：它在窗口内侧 18 DIP 处形成一圈与轮廓平行的分界线，
+    // 用户看到的就是"线内侧和线外侧有色差"。整窗只保留一层均匀的玻璃色。
 
     DrawSearchBar();
     DrawPill();
@@ -863,15 +885,10 @@ void LauncherApp::Paint()
 
     // 玻璃棱线用渐变而不是纯白 1px：纯白描边在亮背景上就是一条扎眼的白线，
     // mac 的观感是"左上受光明亮 → 右下压暗"，渐变才能撑出厚度。
-    // 用户反馈"贴近窗口轮廓的一圈白线"。排查结论：Win11 系统边框（已关）+ 自绘的整圈窗框线 +
-    // 顶部高光三者叠加。这里把最外圈窗框线和顶部高光都去掉，只留面板棱一点点受光，
-    // 窗口边界交给 DWM 阴影和圆角。
-    D2D1_GRADIENT_STOP panelStops[3] = {
-        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, dark_ ? 0.10f : 0.14f)},
-        {0.45f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.04f)},
-        {1.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, dark_ ? 0.16f : 0.10f)},
-    };
-    renderer_.StrokeRoundRectGradient(panel, 16.0f, panelStops, 3, 1.0f, true);
+    // 面板内表层/棱线都去掉：它们会在窗口内侧 18 DIP 处画出一圈与窗口轮廓平行的
+    // 分界线，用户看到的就是"线内侧和线外侧有色差"。现在整窗只有一层均匀的玻璃色，
+    // 边界交给 DWM 阴影。
+
 
     DrawStatusBar();
 
@@ -1177,6 +1194,18 @@ void LauncherApp::RecaptureBackdrop(bool live)
 
 void LauncherApp::RebuildBackdrop()
 {
+    wchar_t path[MAX_PATH] = {};
+    bool dump = GetEnvironmentVariableW(L"GL_NATIVE_DUMP_BACKDROP", path, MAX_PATH) > 0;
+
+    if (dump)
+    {
+        // 诊断：可见状态下重新抓一次并落盘，检查"自己的窗口/阴影是否被抓进背景"
+        backdrop_.CapturePixels(hwnd_, dpi_, settings_.blurRadius);
+        Log("rebuild dump ok=%d", backdrop_.DumpBmp(path) ? 1 : 0);
+        backdrop_.Upload(renderer_);
+        return;
+    }
+
     RecaptureBackdrop(false);
 }
 
