@@ -1,4 +1,5 @@
 #include "app.h"
+#include "settings.h"
 
 #include <d2d1helper.h>
 #include <dwmapi.h>
@@ -6,6 +7,7 @@
 #include <windowsx.h>
 #include <tlhelp32.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <psapi.h>
 #include <cstdarg>
 #include <cstdio>
@@ -163,7 +165,352 @@ DWORD CountProcessThreads()
     return count;
 }
 
+std::wstring FileStem(const std::wstring& path)
+{
+    std::wstring name = path;
+    size_t slash = name.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) name = name.substr(slash + 1);
+    size_t dot = name.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot > 0) name = name.substr(0, dot);
+    return name;
+}
+
+bool EndsWithNoCase(const std::wstring& text, const wchar_t* suffix)
+{
+    size_t n = wcslen(suffix);
+    if (text.size() < n) return false;
+    return _wcsicmp(text.c_str() + (text.size() - n), suffix) == 0;
+}
+
+// .lnk → 真实目标（IShellLink）；.url → InternetShortcut 里的 URL；其余原样返回
+bool ResolveDroppedPath(const std::wstring& path, std::wstring& target)
+{
+    target.clear();
+    if (EndsWithNoCase(path, L".lnk"))
+    {
+        IShellLinkW* link = nullptr;
+        if (FAILED(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(&link))))
+        {
+            return false;
+        }
+
+        IPersistFile* file = nullptr;
+        bool ok = false;
+        if (SUCCEEDED(link->QueryInterface(IID_PPV_ARGS(&file))))
+        {
+            if (SUCCEEDED(file->Load(path.c_str(), STGM_READ)))
+            {
+                wchar_t buf[MAX_PATH] = {};
+                if (SUCCEEDED(link->GetPath(buf, MAX_PATH, nullptr, 0)) && buf[0])
+                {
+                    target = buf;
+                    ok = true;
+                }
+            }
+            file->Release();
+        }
+        link->Release();
+        return ok;
+    }
+
+    if (EndsWithNoCase(path, L".url"))
+    {
+        wchar_t buf[2048] = {};
+        GetPrivateProfileStringW(L"InternetShortcut", L"URL", L"", buf, 2048, path.c_str());
+        if (buf[0])
+        {
+            target = buf;
+            return true;
+        }
+        return false;
+    }
+
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    target = path;
+    return true;
+}
+
 } // namespace
+
+// ── 搜索 / 过滤 ──────────────────────────────────────────────
+
+void LauncherApp::RebuildVisible()
+{
+    visible_.clear();
+    if (filter_.empty())
+    {
+        for (int i = 0; i < (int)entries_.size(); i++) visible_.push_back(i);
+        return;
+    }
+
+    std::wstring needle = filter_;
+    std::transform(needle.begin(), needle.end(), needle.begin(), towlower);
+    for (int i = 0; i < (int)entries_.size(); i++)
+    {
+        std::wstring name = entries_[i].displayName;
+        std::transform(name.begin(), name.end(), name.begin(), towlower);
+        if (name.find(needle) != std::wstring::npos) visible_.push_back(i);
+    }
+}
+
+void LauncherApp::CreateSearchEdit()
+{
+    searchEdit_ = CreateWindowExW(0, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
+        0, 0, 10, 10, hwnd_, (HMENU)1001, instance_, nullptr);
+    if (!searchEdit_)
+    {
+        Log("search edit create failed %lu", GetLastError());
+        return;
+    }
+
+    SendMessageW(searchEdit_, EM_SETCUEBANNER, TRUE, (LPARAM)L"搜索");
+    ApplySearchFont();
+    searchEditProc_ = (WNDPROC)SetWindowLongPtrW(searchEdit_, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
+    LayoutChildren();
+}
+
+void LauncherApp::ApplySearchFont()
+{
+    if (!searchEdit_) return;
+    if (searchFont_) DeleteObject(searchFont_);
+    searchFont_ = CreateFontW(-(int)(13.5f * dpi_), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+    SendMessageW(searchEdit_, WM_SETFONT, (WPARAM)searchFont_, TRUE);
+}
+
+void LauncherApp::LayoutChildren()
+{
+    if (!searchEdit_) return;
+    float cx = widthDip_ * 0.5f;
+    SetWindowPos(searchEdit_, nullptr,
+        (int)((cx - 93.0f) * dpi_), (int)(9.0f * dpi_),
+        (int)(185.0f * dpi_), (int)(24.0f * dpi_),
+        SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+void LauncherApp::OnSearchChanged()
+{
+    if (!searchEdit_) return;
+    wchar_t buf[256] = {};
+    GetWindowTextW(searchEdit_, buf, 256);
+    filter_ = buf;
+    RebuildVisible();
+    scroll_ = 0.0f;
+    hover_ = -1;
+    ScheduleRepaint();
+}
+
+LRESULT CALLBACK LauncherApp::SearchEditProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
+{
+    LauncherApp* self = reinterpret_cast<LauncherApp*>(
+        GetWindowLongPtrW(GetParent(hwnd), GWLP_USERDATA));
+    if (!self)
+    {
+        return DefWindowProcW(hwnd, msg, w, l);
+    }
+
+    if (msg == WM_KEYDOWN)
+    {
+        if (w == VK_ESCAPE)
+        {
+            if (!self->filter_.empty())
+            {
+                SetWindowTextW(hwnd, L"");
+            }
+            else
+            {
+                self->HideLauncher();
+            }
+            return 0;
+        }
+
+        if (w == VK_RETURN)
+        {
+            if (!self->visible_.empty()) self->LaunchEntry(self->visible_.front());
+            return 0;
+        }
+    }
+    else if (msg == WM_CHAR && w == 0x1B)
+    {
+        return 0; // 吃掉 Esc 的提示音
+    }
+
+    return CallWindowProcW(self->searchEditProc_ ? self->searchEditProc_ : DefWindowProcW, hwnd, msg, w, l);
+}
+
+// ── 右键菜单 / 条目编辑 ──────────────────────────────────────
+
+void LauncherApp::ShowItemMenu(int index)
+{
+    if (index < 0 || index >= (int)entries_.size()) return;
+    const AppEntry& e = entries_[index];
+
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, 1, L"打开");
+    AppendMenuW(menu, MF_STRING, 2, L"以管理员身份运行");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 3, L"在资源管理器中打开");
+    AppendMenuW(menu, MF_STRING, 4, L"移除");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 5, L"重命名…");
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 6, L"重新指定目标…");
+
+    POINT pt = {};
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd_);
+    int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr);
+    DestroyMenu(menu);
+    PostMessage(hwnd_, WM_NULL, 0, 0);
+
+    switch (cmd)
+    {
+        case 1: LaunchEntry(index); break;
+        case 2: LaunchEntry(index, true); break;
+        case 3:
+        {
+            std::wstring args = L"/select,\"" + e.targetPath + L"\"";
+            ShellExecuteW(hwnd_, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+            break;
+        }
+        case 4: RemoveEntry(index); break;
+        default: break;
+    }
+}
+
+void LauncherApp::RemoveEntry(int index)
+{
+    if (index < 0 || index >= (int)entries_.size()) return;
+    if (icons_[index]) icons_[index]->Release();
+    entries_.erase(entries_.begin() + index);
+    icons_.erase(icons_.begin() + index);
+    RebuildVisible();
+    std::wstring error;
+    if (!Store::SaveEntries(entries_, &error))
+    {
+        LogW((L"保存失败：" + error).c_str());
+    }
+    Log("removed entry index=%d remaining=%zu", index, entries_.size());
+    ScheduleRepaint();
+}
+
+void LauncherApp::MoveEntry(int from, int to)
+{
+    if (from < 0 || from >= (int)entries_.size()) return;
+    if (to < 0 || to >= (int)entries_.size() || from == to) return;
+
+    AppEntry entry = entries_[from];
+    ID2D1Bitmap* icon = icons_[from];
+    entries_.erase(entries_.begin() + from);
+    icons_.erase(icons_.begin() + from);
+    entries_.insert(entries_.begin() + to, entry);
+    icons_.insert(icons_.begin() + to, icon);
+
+    for (size_t i = 0; i < entries_.size(); i++) entries_[i].sortOrder = (int)i;
+    RebuildVisible();
+
+    std::wstring error;
+    if (!Store::SaveEntries(entries_, &error))
+    {
+        LogW((L"保存失败：" + error).c_str());
+    }
+    Log("moved entry %d -> %d", from, to);
+}
+
+// ── 外部拖入 ────────────────────────────────────────────────
+
+void LauncherApp::HandleDroppedFiles(HDROP drop)
+{
+    POINT pt = {};
+    DragQueryPoint(drop, &pt);
+    POINT dip = {(LONG)(pt.x / dpi_), (LONG)(pt.y / dpi_)};
+    int insertAt = filter_.empty() ? HitTestItems(dip) : -1;
+    if (insertAt < 0) insertAt = (int)entries_.size();
+
+    UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    int added = 0;
+    for (UINT i = 0; i < count; i++)
+    {
+        wchar_t path[MAX_PATH] = {};
+        if (DragQueryFileW(drop, i, path, MAX_PATH) == 0) continue;
+
+        std::wstring target;
+        if (!ResolveDroppedPath(path, target)) continue;
+
+        AppEntry entry;
+        entry.targetPath = target;
+        entry.sourcePath = path;
+        entry.displayName = FileStem(path);
+        if (entry.displayName.empty()) entry.displayName = FileStem(target);
+        if (entry.displayName.empty()) entry.displayName = target;
+
+        bool duplicate = false;
+        for (const auto& existing : entries_)
+        {
+            if (_wcsicmp(existing.targetPath.c_str(), entry.targetPath.c_str()) == 0)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        int index = std::clamp(insertAt + added, 0, (int)entries_.size());
+        entries_.insert(entries_.begin() + index, entry);
+        icons_.insert(icons_.begin() + index, nullptr);
+        added++;
+    }
+
+    for (size_t i = 0; i < entries_.size(); i++) entries_[i].sortOrder = (int)i;
+
+    for (int i = 0; i < (int)entries_.size(); i++)
+    {
+        if (icons_[i] == nullptr)
+        {
+            ID2D1Bitmap* bitmap = nullptr;
+            if (!entries_[i].iconCachePath.empty()) bitmap = renderer_.LoadPng(entries_[i].iconCachePath);
+            if (!bitmap && !entries_[i].targetPath.empty()) bitmap = renderer_.LoadIconFromPath(entries_[i].targetPath);
+            icons_[i] = bitmap;
+        }
+    }
+
+    DragFinish(drop);
+
+    if (added > 0)
+    {
+        RebuildVisible();
+        std::wstring error;
+        if (!Store::SaveEntries(entries_, &error))
+        {
+            LogW((L"保存失败：" + error).c_str());
+        }
+        Log("dropped files added=%d total=%zu", added, entries_.size());
+    }
+    ScheduleRepaint();
+}
+
+void LauncherApp::CheckBrokenEntries()
+{
+    int broken = 0;
+    for (auto& e : entries_)
+    {
+        if (e.targetPath.empty()) continue;
+        bool isUrl = e.targetPath.rfind(L"http://", 0) == 0 || e.targetPath.rfind(L"https://", 0) == 0;
+        bool exists = isUrl || GetFileAttributesW(e.targetPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (!exists && !e.isBroken)
+        {
+            e.isBroken = true;
+            broken++;
+        }
+        else if (exists && e.isBroken)
+        {
+            e.isBroken = false;
+        }
+    }
+    if (broken > 0) Log("broken entries=%d", broken);
+}
 
 int LauncherApp::Run(HINSTANCE instance)
 {
@@ -305,7 +652,8 @@ bool LauncherApp::CreateMainWindow()
     DwmSetWindowAttribute(hwnd_, 33, &pref, sizeof(pref));
     UpdateWindowRegion();
 
-    // WS_OVERLAPPEDWINDOW 默认有最小尺寸约束，原版是 680×460 DIP
+    CreateSearchEdit();
+    DragAcceptFiles(hwnd_, TRUE);
     return true;
 }
 
@@ -320,6 +668,8 @@ void LauncherApp::LoadData()
     }
     Log("loaded entries=%zu dataDir=%ls", entries_.size(), Store::DataDirectory().c_str());
     ApplyTheme();
+    CheckBrokenEntries();
+    RebuildVisible();
 }
 
 void LauncherApp::ApplyTheme()
@@ -327,6 +677,9 @@ void LauncherApp::ApplyTheme()
     dark_ = settings_.theme == ThemeMode::Dark
         || (settings_.theme == ThemeMode::FollowSystem && !SystemUsesLightTheme());
     colors_ = dark_ ? ThemeColors::Dark() : ThemeColors::Light();
+
+    if (searchBackBrush_) DeleteObject(searchBackBrush_);
+    searchBackBrush_ = CreateSolidBrush(dark_ ? RGB(0x2A, 0x2B, 0x31) : RGB(0xE6, 0xE8, 0xED));
 }
 
 void LauncherApp::ApplyTopmost()
@@ -456,13 +809,22 @@ void LauncherApp::DrawSearchBar()
 {
     float cx = widthDip_ * 0.5f;
     D2D1_RECT_F pill = D2D1::RectF(cx - 130.0f, 7.0f, cx + 130.0f, 37.0f);
-    renderer_.FillRoundRect(pill, 15.0f, colors_.searchSurface);
-    renderer_.StrokeRoundRect(pill, 15.0f, colors_.searchBorder, 1.0f);
 
+    // 与子窗口 EDIT 的背景刷同色（EDIT 是实心窗口，胶囊必须跟它一致才看不出接缝）
+    D2D1_COLOR_F bg = dark_
+        ? D2D1::ColorF(0x2A / 255.0f, 0x2B / 255.0f, 0x31 / 255.0f)
+        : D2D1::ColorF(0xE6 / 255.0f, 0xE8 / 255.0f, 0xED / 255.0f);
+    renderer_.FillRoundRect(pill, 15.0f, bg);
+    renderer_.StrokeRoundRect(pill, 15.0f, colors_.searchBorder, 1.0f);
     renderer_.DrawText(L"\uE721", D2D1::RectF(cx - 118.0f, 7.0f, cx - 98.0f, 37.0f),
         renderer_.GlyphFormat(), colors_.searchGlyph);
-    renderer_.DrawText(L"搜索", D2D1::RectF(cx - 94.0f, 7.0f, cx + 118.0f, 37.0f),
-        renderer_.SearchFormat(), colors_.searchGlyph);
+
+    // 右上角齿轮（设置入口），与 WPF 版同位置
+    D2D1_POINT_2F gearCenter = D2D1::Point2F(widthDip_ - 33.0f, 22.0f);
+    renderer_.StrokeRoundRect(D2D1::RectF(gearCenter.x - 13.0f, gearCenter.y - 13.0f,
+        gearCenter.x + 13.0f, gearCenter.y + 13.0f), 13.0f, colors_.searchBorder, 1.2f);
+    renderer_.DrawTextCentered(L"\uE713", D2D1::RectF(gearCenter.x - 13.0f, gearCenter.y - 13.0f,
+        gearCenter.x + 13.0f, gearCenter.y + 13.0f), renderer_.GlyphFormat(), colors_.searchGlyph);
 }
 
 void LauncherApp::DrawPill()
@@ -497,7 +859,7 @@ int LauncherApp::Columns() const
 float LauncherApp::ScrollMax() const
 {
     int cols = std::max(1, Columns());
-    int rows = (int)((entries_.size() + cols - 1) / cols);
+    int rows = (int)((visible_.size() + cols - 1) / cols);
     float content = rows * ItemH;
     float viewport = heightDip_ - GridTopDip - 16.0f;
     return std::max(0.0f, content - viewport);
@@ -512,8 +874,9 @@ int LauncherApp::HitTestItems(POINT clientDip) const
     int row = (int)(((float)clientDip.y - GridTopDip + scroll_) / ItemH);
     int col = (int)(((float)clientDip.x - GridLeft) / ItemStride);
     if (col < 0 || col >= cols || row < 0) return -1;
-    int index = row * cols + col;
-    return index < (int)entries_.size() ? index : -1;
+    int slot = row * cols + col;
+    if (slot < 0 || slot >= (int)visible_.size()) return -1;
+    return visible_[slot];
 }
 
 void LauncherApp::DrawItems()
@@ -524,43 +887,85 @@ void LauncherApp::DrawItems()
     rt->PushAxisAlignedClip(D2D1::RectF(PanelMargin + 1.0f, GridTopDip,
         widthDip_ - PanelMargin - 1.0f, heightDip_ - 8.0f), D2D1_ANTIALIAS_MODE_ALIASED);
 
-    for (size_t i = 0; i < entries_.size(); i++)
+    for (size_t slot = 0; slot < visible_.size(); slot++)
     {
-        RECT r = ItemRect((int)i);
+        int entry = visible_[slot];
+        RECT r = ItemRect((int)slot);
         float x = (float)r.left / dpi_;
         float y = (float)r.top / dpi_;
         if (y > heightDip_ + 8.0f) continue;
         if (y + ItemH < GridTopDip - 8.0f) continue;
 
-        bool hover = ((int)i == hover_);
-        D2D1_RECT_F tile = D2D1::RectF(x + 22.0f, y, x + 90.0f, y + 68.0f);
-        renderer_.FillRoundRect(tile, 17.0f, hover ? colors_.hoverPlate : colors_.iconPlate);
-        renderer_.StrokeRoundRect(tile, 17.0f, hover ? colors_.hoverBorder : colors_.iconPlateBorder, 1.0f);
-
-        D2D1_RECT_F iconRect = D2D1::RectF(tile.left + 6.0f, tile.top + 6.0f, tile.left + 62.0f, tile.top + 62.0f);
-        if (icons_[i])
-        {
-            rt->DrawBitmap(icons_[i], iconRect, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-        }
-        else
-        {
-            std::wstring initial = entries_[i].displayName.empty()
-                ? L"?" : entries_[i].displayName.substr(0, 1);
-            renderer_.DrawTextCentered(initial, D2D1::RectF(tile.left, tile.top, tile.right, tile.bottom),
-                renderer_.InitialFormat(), colors_.initialText);
-        }
-
-        renderer_.DrawText(entries_[i].displayName,
-            D2D1::RectF(x + 2.0f, y + 76.0f, x + ItemW - 2.0f, y + 98.0f),
-            renderer_.NameFormat(), colors_.textPrimary, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+        bool hover = (entry == hover_ && !itemDrag_);
+        bool source = itemDrag_ && entry == dragFrom_;
+        DrawItemTile(entry, x, y, hover, source ? 0.25f : 1.0f);
     }
 
     rt->PopAxisAlignedClip();
+
+    // 拖拽中的浮起副本：跟随光标画一份完整条目
+    if (itemDrag_ && dragFrom_ >= 0)
+    {
+        float gx = (float)dragPoint_.x - ItemW * 0.5f;
+        float gy = (float)dragPoint_.y - 34.0f;
+        DrawItemTile(dragFrom_, gx, gy, true, 1.0f);
+    }
+}
+
+void LauncherApp::DrawItemTile(int entry, float x, float y, bool hover, float alpha)
+{
+    ID2D1HwndRenderTarget* rt = renderer_.Target();
+    if (!rt || entry < 0 || entry >= (int)entries_.size()) return;
+
+    D2D1_COLOR_F plate = hover ? colors_.hoverPlate : colors_.iconPlate;
+    plate.a *= alpha;
+    D2D1_RECT_F tile = D2D1::RectF(x + 22.0f, y, x + 90.0f, y + 68.0f);
+    renderer_.FillRoundRect(tile, 17.0f, plate);
+    renderer_.StrokeRoundRect(tile, 17.0f, colors_.iconPlateBorder, 1.0f);
+
+    D2D1_RECT_F iconRect = D2D1::RectF(tile.left + 6.0f, tile.top + 6.0f, tile.left + 62.0f, tile.top + 62.0f);
+    if (icons_[entry])
+    {
+        rt->DrawBitmap(icons_[entry], iconRect, alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    }
+    else
+    {
+        std::wstring initial = entries_[entry].displayName.empty()
+            ? L"?" : entries_[entry].displayName.substr(0, 1);
+        D2D1_COLOR_F color = colors_.initialText;
+        color.a *= alpha;
+        renderer_.DrawTextCentered(initial, D2D1::RectF(tile.left, tile.top, tile.right, tile.bottom),
+            renderer_.InitialFormat(), color);
+    }
+
+    D2D1_COLOR_F text = colors_.textPrimary;
+    text.a *= alpha;
+    renderer_.DrawText(entries_[entry].displayName,
+        D2D1::RectF(x + 2.0f, y + 76.0f, x + ItemW - 2.0f, y + 98.0f),
+        renderer_.NameFormat(), text, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+
+    if (entries_[entry].isBroken)
+    {
+        D2D1_COLOR_F warn = colors_.warning;
+        warn.a *= alpha;
+        renderer_.FillEllipse(D2D1::Ellipse(D2D1::Point2F(tile.right - 5.0f, tile.top + 5.0f), 8.5f, 8.5f), warn);
+        D2D1_COLOR_F mark = {1.0f, 1.0f, 1.0f, alpha};
+        renderer_.DrawTextCentered(L"!", D2D1::RectF(tile.right - 13.5f, tile.top - 3.5f, tile.right + 3.5f, tile.top + 13.5f),
+            renderer_.SmallFormat(), mark);
+    }
 }
 
 void LauncherApp::DrawEmptyHint()
 {
-    if (!entries_.empty()) return;
+    if (!entries_.empty())
+    {
+        if (!visible_.empty()) return;
+        renderer_.DrawTextCentered(L"没有匹配的应用",
+            D2D1::RectF(0, heightDip_ * 0.5f - 16, widthDip_, heightDip_ * 0.5f + 16),
+            renderer_.SearchFormat(), colors_.textSecondary);
+        return;
+    }
+
     renderer_.DrawTextCentered(L"把程序或快捷方式拖进来",
         D2D1::RectF(0, heightDip_ * 0.5f - 24, widthDip_, heightDip_ * 0.5f),
         renderer_.SearchFormat(), colors_.textPrimary);
@@ -579,18 +984,37 @@ void LauncherApp::DrawStatusBar()
         renderer_.SmallFormat(), dark_ ? colors_.warning : D2D1::ColorF(0.7f, 0.15f, 0.12f));
 }
 
-void LauncherApp::RebuildBackdrop()
+void LauncherApp::RecaptureBackdrop(bool live)
 {
     if (!rendererReady_ || !hwnd_) return;
     ULONGLONG t0 = GetTickCount64();
-    if (backdrop_.Capture(hwnd_, dpi_, settings_.blurRadius, renderer_))
+    bool captured = backdrop_.CapturePixels(hwnd_, dpi_, settings_.blurRadius);
+    ULONGLONG t1 = GetTickCount64();
+    bool uploaded = captured && backdrop_.Upload(renderer_);
+    ULONGLONG t2 = GetTickCount64();
+
+    if (uploaded)
     {
-        Log("backdrop %dx%d in %llu ms", backdrop_.WidthPx(), backdrop_.HeightPx(), GetTickCount64() - t0);
+        if (live)
+        {
+            liveCaptureMs_ += (double)(t1 - t0);
+            liveUploadMs_ += (double)(t2 - t1);
+        }
+        else
+        {
+            Log("backdrop %dx%d in %llu ms (capture %llu / upload %llu)",
+                backdrop_.WidthPx(), backdrop_.HeightPx(), t2 - t0, t1 - t0, t2 - t1);
+        }
     }
-    else
+    else if (!live)
     {
         Log("backdrop capture failed");
     }
+}
+
+void LauncherApp::RebuildBackdrop()
+{
+    RecaptureBackdrop(false);
 }
 
 void LauncherApp::UpdateWindowRegion()
@@ -622,6 +1046,25 @@ void LauncherApp::ScheduleRepaint()
 
 void LauncherApp::OnMouseMove(POINT clientDip)
 {
+    if (press_ >= 0 && (GetAsyncKeyState(VK_LBUTTON) & 0x8000))
+    {
+        int dx = (int)clientDip.x - dragStartPt_.x;
+        int dy = (int)clientDip.y - dragStartPt_.y;
+        if (!itemDrag_ && dx * dx + dy * dy > 36)
+        {
+            itemDrag_ = true;
+            dragFrom_ = press_;
+            Log("item drag start from=%d", press_);
+        }
+
+        if (itemDrag_)
+        {
+            dragPoint_ = clientDip;
+            dragTo_ = HitTestItems(clientDip);
+            ScheduleRepaint();
+        }
+    }
+
     int hit = HitTestItems(clientDip);
     if (hit != hover_)
     {
@@ -635,10 +1078,11 @@ void LauncherApp::OnLeftDown(POINT clientDip)
     float x = (float)clientDip.x;
     float y = (float)clientDip.y;
 
-    // 搜索胶囊位置：M1 只占位，不进入拖动
-    float cx = widthDip_ * 0.5f;
-    if (y < TitleDip && x >= cx - 130.0f && x <= cx + 130.0f)
+    Log("left down dip=%ld,%ld title=%d", clientDip.x, clientDip.y, y < TitleDip ? 1 : 0);
+
+    if (y < TitleDip && x >= widthDip_ - 48.0f && x <= widthDip_ - 18.0f)
     {
+        ShowSettings();
         return;
     }
 
@@ -649,6 +1093,11 @@ void LauncherApp::OnLeftDown(POINT clientDip)
     }
 
     press_ = HitTestItems(clientDip);
+    dragStartPt_ = clientDip;
+    dragPoint_ = clientDip;
+    itemDrag_ = false;
+    dragFrom_ = -1;
+    dragTo_ = -1;
     if (press_ >= 0)
     {
         SetCapture(hwnd_);
@@ -658,13 +1107,22 @@ void LauncherApp::OnLeftDown(POINT clientDip)
 void LauncherApp::OnLeftUp(POINT clientDip)
 {
     ReleaseCapture();
+    Log("left up dip=%ld,%ld press=%d itemDrag=%d from=%d to=%d",
+        clientDip.x, clientDip.y, press_, itemDrag_ ? 1 : 0, dragFrom_, dragTo_);
 
-    int hit = HitTestItems(clientDip);
-    if (press_ >= 0 && hit == press_)
+    if (itemDrag_ && dragFrom_ >= 0 && dragTo_ >= 0 && dragTo_ != dragFrom_ && filter_.empty())
+    {
+        MoveEntry(dragFrom_, dragTo_);
+    }
+    else if (!itemDrag_ && press_ >= 0 && HitTestItems(clientDip) == press_)
     {
         LaunchEntry(press_);
     }
+
     press_ = -1;
+    itemDrag_ = false;
+    dragFrom_ = -1;
+    dragTo_ = -1;
     ScheduleRepaint();
 }
 
@@ -681,6 +1139,9 @@ void LauncherApp::StartWindowDrag()
 {
     if (windowDrag_) return;
     windowDrag_ = true;
+    lastLiveTick_ = 0;
+    liveFrames_ = 0;
+    liveTotalMs_ = 0;
     GetCursorPos(&dragCursorStart_);
     GetWindowRect(hwnd_, &dragWindowStart_);
     dragTimer_ = SetTimer(hwnd_, TIMER_DRAG, 8, nullptr);
@@ -697,6 +1158,19 @@ void LauncherApp::TickWindowDrag()
     SetWindowPos(hwnd_, nullptr, dragWindowStart_.left + dx, dragWindowStart_.top + dy, 0, 0,
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
+    // 拖动中实时背景：约 60fps 抓一帧（抓屏+模糊 ~6–10ms，8ms 的计时器节拍下会自然降到 ~40–60fps）。
+    // 这样窗口移动时背景是"桌面跟着流动"，而不是一张贴死在窗口上的旧图。
+    ULONGLONG now = GetTickCount64();
+    if (now - lastLiveTick_ >= 16)
+    {
+        lastLiveTick_ = now;
+        ULONGLONG t0 = GetTickCount64();
+        RecaptureBackdrop(true);
+        liveTotalMs_ += (double)(GetTickCount64() - t0);
+        liveFrames_++;
+        ScheduleRepaint();
+    }
+
     if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0)
     {
         StopWindowDrag();
@@ -709,23 +1183,47 @@ void LauncherApp::StopWindowDrag()
     windowDrag_ = false;
     if (dragTimer_) { KillTimer(hwnd_, TIMER_DRAG); dragTimer_ = 0; }
     ReleaseCapture();
-    Log("window drag end rect=(%ld,%ld)", dragWindowStart_.left, dragWindowStart_.top);
+    Log("window drag end rect=(%ld,%ld) liveFrames=%d avg=%.1fms (capture=%.1f upload=%.1f blt=%d blur=%d)",
+        dragWindowStart_.left, dragWindowStart_.top, liveFrames_,
+        liveFrames_ > 0 ? liveTotalMs_ / liveFrames_ : 0.0,
+        liveFrames_ > 0 ? liveCaptureMs_ / liveFrames_ : 0.0,
+        liveFrames_ > 0 ? liveUploadMs_ / liveFrames_ : 0.0,
+        backdrop_.LastBltMs(), backdrop_.LastBlurMs());
     RebuildBackdrop();
     ScheduleRepaint();
 }
 
-void LauncherApp::LaunchEntry(int index)
+void LauncherApp::LaunchEntry(int index, bool asAdmin)
 {
     if (index < 0 || index >= (int)entries_.size()) return;
     const AppEntry& e = entries_[index];
     if (e.targetPath.empty()) return;
 
-    HINSTANCE result = ShellExecuteW(hwnd_, L"open", e.targetPath.c_str(),
-        e.arguments.empty() ? nullptr : e.arguments.c_str(),
-        e.workingDirectory.empty() ? nullptr : e.workingDirectory.c_str(),
-        SW_SHOWNORMAL);
+    INT_PTR result = 0;
+    if (asAdmin)
+    {
+        SHELLEXECUTEINFOW info = {};
+        info.cbSize = sizeof(info);
+        info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        info.hwnd = hwnd_;
+        info.lpVerb = L"runas";
+        info.lpFile = e.targetPath.c_str();
+        info.lpParameters = e.arguments.empty() ? nullptr : e.arguments.c_str();
+        info.lpDirectory = e.workingDirectory.empty() ? nullptr : e.workingDirectory.c_str();
+        info.nShow = SW_SHOWNORMAL;
+        result = ShellExecuteExW(&info) ? 1 : 0;
+        if (info.hProcess) CloseHandle(info.hProcess);
+    }
+    else
+    {
+        HINSTANCE hr = ShellExecuteW(hwnd_, L"open", e.targetPath.c_str(),
+            e.arguments.empty() ? nullptr : e.arguments.c_str(),
+            e.workingDirectory.empty() ? nullptr : e.workingDirectory.c_str(),
+            SW_SHOWNORMAL);
+        result = (INT_PTR)hr;
+    }
 
-    if ((INT_PTR)result <= 32)
+    if (result <= 32)
     {
         statusText_ = L"启动失败：" + e.displayName;
         showStatus_ = true;
@@ -735,7 +1233,7 @@ void LauncherApp::LaunchEntry(int index)
     }
     else
     {
-        Log("launch ok index=%d", index);
+        Log("launch ok index=%d admin=%d", index, asAdmin ? 1 : 0);
         HideLauncher();
     }
 }
@@ -756,10 +1254,20 @@ void LauncherApp::ToggleVisible()
 
 void LauncherApp::ShowLauncher()
 {
-    // 先抓背景再显示：窗口不可见时抓到的是干净的桌面
-    RebuildBackdrop();
+    // 先抓背景再显示：窗口不可见时抓到的是干净的桌面（隐藏期间桌面可能已经变了）
+    if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_))
+    {
+        backdrop_.CapturePixels(hwnd_, dpi_, settings_.blurRadius);
+    }
+
     ShowWindow(hwnd_, SW_SHOW);
+    if (rendererReady_)
+    {
+        backdrop_.Upload(renderer_);
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
     SetForegroundWindow(hwnd_);
+    if (searchEdit_) SetFocus(searchEdit_);
     ScheduleRepaint();
     Log("show");
 }
@@ -769,6 +1277,32 @@ void LauncherApp::HideLauncher()
     if (windowDrag_) StopWindowDrag();
     ShowWindow(hwnd_, SW_HIDE);
     Log("hide");
+}
+
+void LauncherApp::ShowSettings()
+{
+    if (windowDrag_) StopWindowDrag();
+
+    SettingsDialog::ShowModal(hwnd_, instance_, settings_, [this](const Settings& updated) {
+        settings_ = updated;
+        ApplyTheme();
+        ApplyTopmost();
+        ApplyHotkey();
+        ApplySearchFont();
+
+        for (auto* icon : icons_)
+        {
+            if (icon) icon->Release();
+        }
+        icons_.clear();
+        LoadIcons();
+        RebuildVisible();
+        RebuildBackdrop();
+        ScheduleRepaint();
+    });
+
+    Log("settings closed theme=%d blur=%.0f topmost=%d", (int)settings_.theme,
+        settings_.blurRadius, settings_.topmost ? 1 : 0);
 }
 
 void LauncherApp::InitTray()
@@ -797,7 +1331,7 @@ void LauncherApp::ShowTrayMenu()
 {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, 1, IsWindowVisible(hwnd_) ? L"隐藏" : L"打开");
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 2, L"设置…");
+    AppendMenuW(menu, MF_STRING, 2, L"设置…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 3, L"退出");
 
@@ -809,6 +1343,7 @@ void LauncherApp::ShowTrayMenu()
     PostMessage(hwnd_, WM_NULL, 0, 0);
 
     if (cmd == 1) ToggleVisible();
+    else if (cmd == 2) ShowSettings();
     else if (cmd == 3)
     {
         exiting_ = true;
@@ -883,8 +1418,18 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             POINT c = p;
             ScreenToClient(hwnd, &c);
-            // 只有标题区可以拖；其余全部交给客户区自己处理（M1 不做边缘缩放）
-            if (c.y >= 0 && (float)c.y / dpi_ < TitleDip)
+            float dx = (float)c.x / dpi_;
+            float dy = (float)c.y / dpi_;
+            float widthDip = ClientWidthDip(hwnd, dpi_);
+
+            // 右上角齿轮是客户区按钮：先于"标题栏拖动"判定，否则永远点不到
+            if (dy >= 0.0f && dy < TitleDip && dx >= widthDip - 48.0f && dx <= widthDip - 18.0f)
+            {
+                return HTCLIENT;
+            }
+
+            // 只有标题区可以拖；其余全部交给客户区自己处理（M2 仍不做边缘缩放）
+            if (c.y >= 0 && dy < TitleDip)
             {
                 return HTCAPTION;
             }
@@ -935,6 +1480,8 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
                 }
                 if (scroll_ > ScrollMax()) scroll_ = ScrollMax();
                 UpdateWindowRegion();
+                LayoutChildren();
+                RebuildBackdrop();
                 ScheduleRepaint();
             }
             return 0;
@@ -954,6 +1501,8 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             }
             RebuildBackdrop();
             UpdateWindowRegion();
+            ApplySearchFont();
+            LayoutChildren();
             ScheduleRepaint();
             return 0;
         }
@@ -980,6 +1529,35 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             POINT dip = {(LONG)(p.x / dpi_), (LONG)(p.y / dpi_)};
             OnLeftUp(dip);
             return 0;
+        }
+
+        case WM_RBUTTONUP:
+        {
+            POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            POINT dip = {(LONG)(p.x / dpi_), (LONG)(p.y / dpi_)};
+            int index = HitTestItems(dip);
+            if (index >= 0) ShowItemMenu(index);
+            return 0;
+        }
+
+        case WM_DROPFILES:
+            HandleDroppedFiles(reinterpret_cast<HDROP>(w));
+            return 0;
+
+        case WM_COMMAND:
+            if (LOWORD(w) == 1001 && HIWORD(w) == EN_CHANGE)
+            {
+                OnSearchChanged();
+                return 0;
+            }
+            break;
+
+        case WM_CTLCOLOREDIT:
+        {
+            HDC dc = reinterpret_cast<HDC>(w);
+            SetTextColor(dc, dark_ ? RGB(0xF2, 0xF2, 0xF7) : RGB(0x1C, 0x1C, 0x1E));
+            SetBkColor(dc, dark_ ? RGB(0x2A, 0x2B, 0x31) : RGB(0xE6, 0xE8, 0xED));
+            return reinterpret_cast<LRESULT>(searchBackBrush_);
         }
 
         case WM_MOUSEWHEEL:

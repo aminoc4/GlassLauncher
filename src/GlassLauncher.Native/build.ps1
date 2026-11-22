@@ -20,7 +20,7 @@ $flags = @(
 $libs = @(
     '-ld2d1', '-ldwrite', '-ldwmapi', '-lwindowscodecs',
     '-luser32', '-lgdi32', '-lole32', '-luuid', '-lshell32', '-lshlwapi',
-    '-lpsapi', '-ladvapi32'
+    '-lpsapi', '-ladvapi32', '-lcomctl32'
 )
 
 Write-Host "g++ $($sources.Count) sources -> $exe"

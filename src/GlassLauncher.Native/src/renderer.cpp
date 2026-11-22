@@ -165,6 +165,13 @@ void Renderer::FillRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_COLO
     rt_->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush_);
 }
 
+void Renderer::FillEllipse(const D2D1_ELLIPSE& e, const D2D1_COLOR_F& c)
+{
+    if (!rt_ || !brush_) return;
+    SetBrush(c);
+    rt_->FillEllipse(e, brush_);
+}
+
 void Renderer::StrokeRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_COLOR_F& c, float width)
 {
     if (!rt_ || !brush_) return;

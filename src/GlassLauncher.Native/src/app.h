@@ -33,15 +33,33 @@ private:
     // ── 数据 ──
     std::vector<AppEntry> entries_;
     std::vector<ID2D1Bitmap*> icons_;
+    std::vector<int> visible_;          // 过滤后的条目下标（空过滤时全部）
+    std::wstring filter_;
     Settings settings_;
+
+    // 搜索框（子窗口 EDIT：IME/选中/剪贴板都由系统处理）
+    HWND searchEdit_ = nullptr;
+    HFONT searchFont_ = nullptr;
+    HBRUSH searchBackBrush_ = nullptr;
+    WNDPROC searchEditProc_ = nullptr;
 
     // ── 交互状态 ──
     int hover_ = -1;
     int press_ = -1;
+    int dragFrom_ = -1;
+    int dragTo_ = -1;
+    POINT dragStartPt_ = {};
+    POINT dragPoint_ = {};
+    bool itemDrag_ = false;
     bool windowDrag_ = false;
     POINT dragCursorStart_ = {};
     RECT dragWindowStart_ = {};
     UINT_PTR dragTimer_ = 0;
+    ULONGLONG lastLiveTick_ = 0;
+    int liveFrames_ = 0;
+    double liveTotalMs_ = 0;
+    double liveCaptureMs_ = 0;
+    double liveUploadMs_ = 0;
     float scroll_ = 0.0f;
     bool showStatus_ = false;
     std::wstring statusText_;
@@ -67,6 +85,7 @@ private:
     void LoadIcons();
     void ApplyTheme();
     void ApplyTopmost();
+    void CheckBrokenEntries();
 
     void Paint();
     void DrawBackdrop();
@@ -74,10 +93,12 @@ private:
     void DrawSearchBar();
     void DrawPill();
     void DrawItems();
+    void DrawItemTile(int entry, float x, float y, bool hover, float alpha);
     void DrawEmptyHint();
     void DrawStatusBar();
 
     void RebuildBackdrop();
+    void RecaptureBackdrop(bool live);
     void ScheduleRepaint();
     void UpdateWindowRegion();
 
@@ -93,6 +114,16 @@ private:
     void OnLeftDown(POINT clientDip);
     void OnLeftUp(POINT clientDip);
     void OnMouseWheel(int delta);
+    void ShowItemMenu(int index);
+    void RemoveEntry(int index);
+    void MoveEntry(int from, int to);
+    void HandleDroppedFiles(HDROP drop);
+    void RebuildVisible();
+    void LayoutChildren();
+    void CreateSearchEdit();
+    void ApplySearchFont();
+    static LRESULT CALLBACK SearchEditProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l);
+    void OnSearchChanged();
     void StartWindowDrag();
     void StopWindowDrag();
     void TickWindowDrag();
@@ -100,7 +131,8 @@ private:
     void ToggleVisible();
     void ShowLauncher();
     void HideLauncher();
-    void LaunchEntry(int index);
+    void LaunchEntry(int index, bool asAdmin = false);
+    void ShowSettings();
 
     void InitTray();
     void RemoveTray();

@@ -88,13 +88,17 @@ bool Backdrop::CapturePixels(HWND hwnd, float dpi, double blurRadiusDip)
     }
 
     HGDIOBJ previous = SelectObject(memory, dib);
-    SetStretchBltMode(memory, HALFTONE);
+    // COLORONCOLOR（点采样）比 HALFTONE 快一个数量级；后面还要做 3 次模糊，
+    // 点采样的锯齿会被完全盖掉，视觉上看不出差别。
+    SetStretchBltMode(memory, COLORONCOLOR);
     SetBrushOrgEx(memory, 0, 0, nullptr);
 
     int srcX = wr.left - padPx;
     int srcY = wr.top - padPx;
+    ULONGLONG t0 = GetTickCount64();
     BOOL ok = StretchBlt(memory, 0, 0, halfW, halfH, screen, srcX, srcY, fullW, fullH, SRCCOPY | CAPTUREBLT);
     GdiFlush();
+    ULONGLONG t1 = GetTickCount64();
 
     if (ok)
     {
@@ -111,6 +115,8 @@ bool Backdrop::CapturePixels(HWND hwnd, float dpi, double blurRadiusDip)
 
         width_ = halfW;
         height_ = halfH;
+        lastBltMs_ = (int)(t1 - t0);
+        lastBlurMs_ = (int)(GetTickCount64() - t1);
     }
 
     SelectObject(memory, previous);
@@ -123,11 +129,20 @@ bool Backdrop::CapturePixels(HWND hwnd, float dpi, double blurRadiusDip)
 bool Backdrop::Upload(Renderer& renderer)
 {
     if (pixels_.empty() || width_ <= 0 || height_ <= 0) return false;
+
+    // 同尺寸复用：拖动中的实时背景每帧都在更新，不能每帧新建 D2D 位图
     if (bitmap_)
     {
+        D2D1_SIZE_U size = bitmap_->GetPixelSize();
+        if ((int)size.width == width_ && (int)size.height == height_)
+        {
+            return SUCCEEDED(bitmap_->CopyFromMemory(nullptr, pixels_.data(), (UINT32)width_ * 4));
+        }
+
         bitmap_->Release();
         bitmap_ = nullptr;
     }
+
     bitmap_ = renderer.CreateBitmapFromBgra(pixels_.data(), (UINT)width_, (UINT)height_, (UINT)width_ * 4);
     return bitmap_ != nullptr;
 }

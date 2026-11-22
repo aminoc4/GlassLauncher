@@ -29,6 +29,8 @@ public:
     bool Valid() const { return bitmap_ != nullptr; }
     int WidthPx() const { return width_; }
     int HeightPx() const { return height_; }
+    int LastBltMs() const { return lastBltMs_; }
+    int LastBlurMs() const { return lastBlurMs_; }
 
 private:
     static void BoxBlur(std::vector<uint32_t>& pixels, int width, int height, int radius);
@@ -38,6 +40,8 @@ private:
     std::vector<uint32_t> pixels_;
     int width_ = 0;
     int height_ = 0;
+    int lastBltMs_ = 0;
+    int lastBlurMs_ = 0;
     ID2D1Bitmap* bitmap_ = nullptr;
 };
 

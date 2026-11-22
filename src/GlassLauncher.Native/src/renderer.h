@@ -48,6 +48,7 @@ public:
     // 基础图元（DIP 坐标）
     void FillRect(const D2D1_RECT_F& r, const D2D1_COLOR_F& c);
     void FillRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_COLOR_F& c);
+    void FillEllipse(const D2D1_ELLIPSE& e, const D2D1_COLOR_F& c);
     void StrokeRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_COLOR_F& c, float width);
     void FillVerticalGradient(const D2D1_RECT_F& r, const D2D1_COLOR_F& top, const D2D1_COLOR_F& bottom);
     void DrawText(const std::wstring& text, const D2D1_RECT_F& r, IDWriteTextFormat* format,
