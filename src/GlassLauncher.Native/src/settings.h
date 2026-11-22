@@ -27,6 +27,8 @@ private:
 
     void CreateChildren();
     void LoadValues();
+    void UpdateBlurLabel();
+    void ResetToDefaults();
     Settings ReadValues() const;
     void Commit();
 
@@ -34,7 +36,15 @@ private:
     HWND owner_ = nullptr;
     HWND hwnd_ = nullptr;
     HFONT font_ = nullptr;
+    HFONT fontBold_ = nullptr;
     HBRUSH backBrush_ = nullptr;
+    HBRUSH editBrush_ = nullptr;
+    bool dark_ = false;
+    COLORREF colorBack_ = 0;
+    COLORREF colorText_ = 0;
+    COLORREF colorHint_ = 0;
+    COLORREF colorEditBack_ = 0;
+    COLORREF colorEditText_ = 0;
     Settings settings_;
     ApplyFn onApply_;
 };

@@ -33,7 +33,31 @@ $iconRc = ($icon -replace '\\', '/')
 $rcFile = Join-Path $OutDir 'app.rc'
 $resFile = Join-Path $OutDir 'app.res'
 if (Test-Path $icon) {
-    "1 ICON `"$iconRc`"" | Set-Content $rcFile -Encoding ASCII
+    @"
+1 ICON "$iconRc"
+
+1 VERSIONINFO
+FILEVERSION 1,0,1,0
+PRODUCTVERSION 1,0,1,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "FileDescription", "GlassLauncher Native"
+      VALUE "FileVersion", "1.0.1"
+      VALUE "ProductName", "GlassLauncher"
+      VALUE "ProductVersion", "1.0.1"
+      VALUE "CompanyName", "aminoc4"
+      VALUE "OriginalFilename", "GlassLauncherNative.exe"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 0x4b0
+  END
+END
+"@ | Set-Content $rcFile -Encoding ASCII
     & windres $rcFile -O coff -o $resFile
     if ($LASTEXITCODE -ne 0) { throw "windres failed ($LASTEXITCODE)" }
 } else {

@@ -1758,6 +1758,7 @@ void LauncherApp::HideLauncher()
 void LauncherApp::ShowSettings()
 {
     if (windowDrag_) StopWindowDrag();
+    Log("settings open dark=%d", dark_ ? 1 : 0);
 
     modalOpen_ = true;
     SettingsDialog::ShowModal(hwnd_, instance_, settings_, [this](const Settings& updated) {
