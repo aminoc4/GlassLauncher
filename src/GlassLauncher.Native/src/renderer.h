@@ -50,6 +50,11 @@ public:
     void FillRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_COLOR_F& c);
     void FillEllipse(const D2D1_ELLIPSE& e, const D2D1_COLOR_F& c);
     void StrokeRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_COLOR_F& c, float width);
+    void StrokeRoundRectGradient(const D2D1_RECT_F& r, float radius,
+                                 const D2D1_GRADIENT_STOP* stops, UINT32 count, float width,
+                                 bool diagonal);
+    void FillRectGradient(const D2D1_RECT_F& r, const D2D1_GRADIENT_STOP* stops, UINT32 count,
+                          bool horizontal);
     void FillVerticalGradient(const D2D1_RECT_F& r, const D2D1_COLOR_F& top, const D2D1_COLOR_F& bottom);
     void DrawText(const std::wstring& text, const D2D1_RECT_F& r, IDWriteTextFormat* format,
                   const D2D1_COLOR_F& color, DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING,

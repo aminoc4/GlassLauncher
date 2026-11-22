@@ -179,6 +179,47 @@ void Renderer::StrokeRoundRect(const D2D1_RECT_F& r, float radius, const D2D1_CO
     rt_->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), brush_, width);
 }
 
+void Renderer::StrokeRoundRectGradient(const D2D1_RECT_F& r, float radius,
+                                       const D2D1_GRADIENT_STOP* stops, UINT32 count, float width,
+                                       bool diagonal)
+{
+    if (!rt_) return;
+    ID2D1GradientStopCollection* collection = nullptr;
+    if (FAILED(rt_->CreateGradientStopCollection(stops, count, &collection))) return;
+
+    D2D1_POINT_2F start = diagonal ? D2D1::Point2F(r.left, r.top) : D2D1::Point2F(r.left, r.top);
+    D2D1_POINT_2F end = diagonal ? D2D1::Point2F(r.right, r.bottom) : D2D1::Point2F(r.left, r.bottom);
+
+    ID2D1LinearGradientBrush* gradient = nullptr;
+    if (SUCCEEDED(rt_->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(start, end), collection, &gradient)))
+    {
+        rt_->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), gradient, width);
+        gradient->Release();
+    }
+    collection->Release();
+}
+
+void Renderer::FillRectGradient(const D2D1_RECT_F& r, const D2D1_GRADIENT_STOP* stops, UINT32 count,
+                                bool horizontal)
+{
+    if (!rt_) return;
+    ID2D1GradientStopCollection* collection = nullptr;
+    if (FAILED(rt_->CreateGradientStopCollection(stops, count, &collection))) return;
+
+    D2D1_POINT_2F start = horizontal ? D2D1::Point2F(r.left, r.top) : D2D1::Point2F(r.left, r.top);
+    D2D1_POINT_2F end = horizontal ? D2D1::Point2F(r.right, r.top) : D2D1::Point2F(r.left, r.bottom);
+
+    ID2D1LinearGradientBrush* gradient = nullptr;
+    if (SUCCEEDED(rt_->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(start, end), collection, &gradient)))
+    {
+        rt_->FillRectangle(r, gradient);
+        gradient->Release();
+    }
+    collection->Release();
+}
+
 void Renderer::FillVerticalGradient(const D2D1_RECT_F& r, const D2D1_COLOR_F& top, const D2D1_COLOR_F& bottom)
 {
     if (!rt_) return;

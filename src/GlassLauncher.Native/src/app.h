@@ -81,6 +81,14 @@ private:
     int autoRepeat_ = 1;
     int autoGapMs_ = 700;
     bool autoDragPending_ = false;
+
+    // 打开/关闭动画：分层窗口 alpha 淡入淡出（180ms）
+    bool layered_ = false;
+    bool fading_ = false;
+    bool fadeOut_ = false;
+    ULONGLONG fadeStart_ = 0;
+    ULONGLONG fadeDurationMs_ = 180;
+    BYTE fadeAlpha_ = 255;
     float scroll_ = 0.0f;
     bool showStatus_ = false;
     std::wstring statusText_;
@@ -162,6 +170,8 @@ private:
     void ToggleVisible();
     void ShowLauncher();
     void HideLauncher();
+    void TickFade();
+    void StartFade(bool fadeOut);
     void LaunchEntry(int index, bool asAdmin = false);
     void ShowSettings();
 

@@ -44,6 +44,19 @@ private:
     static void BoxBlurPass(std::vector<uint32_t>& src, std::vector<uint32_t>& dst,
                             int width, int height, int radius, bool horizontal);
 
+    // 抓屏用的 GDI 资源跨调用复用：每次显示都 CreateDC/CreateDIBSection 会累积句柄
+    // （实测 hide/show 循环里每轮约 10 个），而且也更慢。
+    bool EnsureGdi(int width, int height);
+    void ReleaseGdi();
+
+    HDC screenDc_ = nullptr;
+    HDC memoryDc_ = nullptr;
+    HBITMAP dib_ = nullptr;
+    HGDIOBJ previous_ = nullptr;
+    void* bits_ = nullptr;
+    int gdiWidth_ = 0;
+    int gdiHeight_ = 0;
+
     std::vector<uint32_t> pixels_;
     int width_ = 0;
     int height_ = 0;

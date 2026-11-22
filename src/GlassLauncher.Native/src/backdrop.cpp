@@ -29,6 +29,7 @@ struct BitmapInfo32
 
 void Backdrop::Release()
 {
+    ReleaseGdi();
     if (bitmap_)
     {
         bitmap_->Release();
@@ -59,51 +60,25 @@ bool Backdrop::CapturePixels(HWND hwnd, float dpi, double blurRadiusDip)
     int halfW = std::max(1, (fullW + Downscale / 2) / Downscale);
     int halfH = std::max(1, (fullH + Downscale / 2) / Downscale);
 
-    HDC screen = GetDC(nullptr);
-    if (!screen) return false;
+    if (!EnsureGdi(halfW, halfH)) return false;
 
-    HDC memory = CreateCompatibleDC(screen);
-    if (!memory)
-    {
-        ReleaseDC(nullptr, screen);
-        return false;
-    }
-
-    BitmapInfo32 info = {};
-    info.header.size = sizeof(BitmapInfoHeader32);
-    info.header.width = halfW;
-    info.header.height = -halfH; // 自上而下
-    info.header.planes = 1;
-    info.header.bitCount = 32;
-    info.header.compression = BI_RGB;
-
-    void* bits = nullptr;
-    HBITMAP dib = CreateDIBSection(screen, reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (!dib || !bits)
-    {
-        if (dib) DeleteObject(dib);
-        DeleteDC(memory);
-        ReleaseDC(nullptr, screen);
-        return false;
-    }
-
-    HGDIOBJ previous = SelectObject(memory, dib);
     // COLORONCOLOR（点采样）比 HALFTONE 快一个数量级；后面还要做 3 次模糊，
     // 点采样的锯齿会被完全盖掉，视觉上看不出差别。
-    SetStretchBltMode(memory, COLORONCOLOR);
-    SetBrushOrgEx(memory, 0, 0, nullptr);
+    SetStretchBltMode(memoryDc_, COLORONCOLOR);
+    SetBrushOrgEx(memoryDc_, 0, 0, nullptr);
 
     int srcX = wr.left - padPx;
     int srcY = wr.top - padPx;
     ULONGLONG t0 = GetTickCount64();
-    BOOL ok = StretchBlt(memory, 0, 0, halfW, halfH, screen, srcX, srcY, fullW, fullH, SRCCOPY | CAPTUREBLT);
+    BOOL ok = StretchBlt(memoryDc_, 0, 0, halfW, halfH, screenDc_, srcX, srcY, fullW, fullH,
+        SRCCOPY | CAPTUREBLT);
     GdiFlush();
     ULONGLONG t1 = GetTickCount64();
 
     if (ok)
     {
         pixels_.resize((size_t)halfW * halfH);
-        memcpy(pixels_.data(), bits, pixels_.size() * 4);
+        memcpy(pixels_.data(), bits_, pixels_.size() * 4);
 
         for (auto& px : pixels_)
         {
@@ -122,11 +97,64 @@ bool Backdrop::CapturePixels(HWND hwnd, float dpi, double blurRadiusDip)
         lastBlurMs_ = (int)(GetTickCount64() - t1);
     }
 
-    SelectObject(memory, previous);
-    DeleteObject(dib);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
     return ok && !pixels_.empty();
+}
+
+bool Backdrop::EnsureGdi(int width, int height)
+{
+    if (memoryDc_ && width == gdiWidth_ && height == gdiHeight_) return true;
+    ReleaseGdi();
+
+    screenDc_ = GetDC(nullptr);
+    if (!screenDc_) return false;
+
+    memoryDc_ = CreateCompatibleDC(screenDc_);
+    if (!memoryDc_)
+    {
+        ReleaseGdi();
+        return false;
+    }
+
+    BitmapInfo32 info = {};
+    info.header.size = sizeof(BitmapInfoHeader32);
+    info.header.width = width;
+    info.header.height = -height;
+    info.header.planes = 1;
+    info.header.bitCount = 32;
+    info.header.compression = BI_RGB;
+
+    dib_ = CreateDIBSection(screenDc_, reinterpret_cast<BITMAPINFO*>(&info), DIB_RGB_COLORS,
+        &bits_, nullptr, 0);
+    if (!dib_ || !bits_)
+    {
+        ReleaseGdi();
+        return false;
+    }
+
+    previous_ = SelectObject(memoryDc_, dib_);
+    if (!previous_ || previous_ == (HGDIOBJ)-1)
+    {
+        ReleaseGdi();
+        return false;
+    }
+
+    gdiWidth_ = width;
+    gdiHeight_ = height;
+    return true;
+}
+
+void Backdrop::ReleaseGdi()
+{
+    if (memoryDc_ && previous_ && previous_ != (HGDIOBJ)-1)
+    {
+        SelectObject(memoryDc_, previous_);
+    }
+    if (dib_) { DeleteObject(dib_); dib_ = nullptr; }
+    if (memoryDc_) { DeleteDC(memoryDc_); memoryDc_ = nullptr; }
+    if (screenDc_) { ReleaseDC(nullptr, screenDc_); screenDc_ = nullptr; }
+    bits_ = nullptr;
+    previous_ = nullptr;
+    gdiWidth_ = gdiHeight_ = 0;
 }
 
 bool Backdrop::Upload(Renderer& renderer)

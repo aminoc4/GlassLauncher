@@ -258,6 +258,8 @@ void LauncherApp::RebuildVisible()
 
 void LauncherApp::CreateSearchEdit()
 {
+    if (GetEnvironmentVariableW(L"GL_NATIVE_NO_SEARCH_EDIT", nullptr, 0) > 0) return;
+
     searchEdit_ = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
         0, 0, 10, 10, hwnd_, (HMENU)1001, instance_, nullptr);
@@ -585,7 +587,11 @@ int LauncherApp::Run(HINSTANCE instance)
     backdrop_.CapturePixels(hwnd_, dpi_, settings_.blurRadius);
 
     // 2) 先显示窗口，再建 D2D 渲染目标（HwndRenderTarget 在可见窗口上最稳）
-    ShowWindow(hwnd_, SW_SHOW);
+    if (layered_)
+    {
+        SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
+    }
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     UpdateWindow(hwnd_);
 
     wchar_t noExclusion[8] = {};
@@ -621,6 +627,11 @@ int LauncherApp::Run(HINSTANCE instance)
     backdrop_.Upload(renderer_);
     InvalidateRect(hwnd_, nullptr, TRUE);
 
+    if (layered_)
+    {
+        StartFade(false);
+    }
+
     InitTray();
     ApplyHotkey();
     ApplyTopmost();
@@ -644,6 +655,17 @@ int LauncherApp::Run(HINSTANCE instance)
             autoDy_ = 80;
         }
         ScheduleAutoDrag(1200);
+    }
+
+    // 打开/关闭动画时长（测试可调）
+    {
+        wchar_t fadeBuf[32] = {};
+        int fadeMs = 0;
+        if (GetEnvironmentVariableW(L"GL_NATIVE_FADE_MS", fadeBuf, 32) > 0 &&
+            swscanf(fadeBuf, L"%d", &fadeMs) == 1 && fadeMs > 0)
+        {
+            fadeDurationMs_ = (ULONGLONG)fadeMs;
+        }
     }
 
     // 自动化测试：到期自动退出（避免测试进程留在用户桌面上）
@@ -712,12 +734,21 @@ bool LauncherApp::CreateMainWindow()
     int x = work.left + (work.right - work.left - w) / 2;
     int y = work.top + (work.bottom - work.top - h) / 2;
 
+    // 打开/关闭动画：分层窗口 alpha 淡入淡出（默认开启；GL_NATIVE_NO_ANIM=1 可关）
+    layered_ = GetEnvironmentVariableW(L"GL_NATIVE_NO_ANIM", nullptr, 0) == 0;
+    DWORD exStyle = layered_ ? WS_EX_LAYERED : 0;
+
     // 无标题栏自定义框架：WS_POPUP + WS_THICKFRAME（保留 DWM 阴影），客户区铺满
-    hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"应用程序",
+    hwnd_ = CreateWindowExW(exStyle, wc.lpszClassName, L"应用程序",
         WS_POPUP | WS_THICKFRAME, x, y, w, h, nullptr, nullptr, inst, this);
     if (!hwnd_)
     {
         return false;
+    }
+
+    if (layered_)
+    {
+        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
     }
 
     int pref = 2; // DWMWCP_ROUND
@@ -821,10 +852,32 @@ void LauncherApp::Paint()
     DrawItems();
     DrawEmptyHint();
 
-    renderer_.StrokeRoundRect(panel, 16.0f, colors_.panelEdge, 1.0f);
-    renderer_.StrokeRoundRect(D2D1::RectF(0.5f, 0.5f, widthDip_ - 0.5f, heightDip_ - 0.5f),
-        8.0f, colors_.windowEdge, 1.0f);
-    renderer_.FillRect(D2D1::RectF(22.0f, 0.5f, widthDip_ - 22.0f, 1.5f), colors_.specular);
+    // 玻璃棱线用渐变而不是纯白 1px：纯白描边在亮背景上就是一条扎眼的白线，
+    // mac 的观感是"左上受光明亮 → 右下压暗"，渐变才能撑出厚度。
+    D2D1_GRADIENT_STOP panelStops[3] = {
+        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, dark_ ? 0.42f : 0.60f)},
+        {0.45f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f)},
+        {1.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, dark_ ? 0.30f : 0.22f)},
+    };
+    renderer_.StrokeRoundRectGradient(panel, 16.0f, panelStops, 3, 1.0f, true);
+
+    D2D1_GRADIENT_STOP windowStops[3] = {
+        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, dark_ ? 0.50f : 0.80f)},
+        {0.45f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f)},
+        {1.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, dark_ ? 0.36f : 0.28f)},
+    };
+    renderer_.StrokeRoundRectGradient(D2D1::RectF(0.5f, 0.5f, widthDip_ - 0.5f, heightDip_ - 0.5f),
+        8.0f, windowStops, 3, 1.0f, true);
+
+    D2D1_GRADIENT_STOP specularStops[5] = {
+        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f)},
+        {0.12f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.50f)},
+        {0.5f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.82f)},
+        {0.88f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.50f)},
+        {1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f)},
+    };
+    renderer_.FillRectGradient(D2D1::RectF(22.0f, 0.5f, widthDip_ - 22.0f, 1.5f),
+        specularStops, 5, true);
 
     DrawStatusBar();
 
@@ -1564,8 +1617,67 @@ void LauncherApp::ToggleVisible()
     }
 }
 
+void LauncherApp::StartFade(bool fadeOut)
+{
+    if (!layered_ || !hwnd_) return;
+
+    fadeOut_ = fadeOut;
+    fading_ = true;
+    fadeStart_ = GetTickCount64();
+    if (fadeOut)
+    {
+        SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+    }
+    SetTimer(hwnd_, 7 /* TIMER_FADE */, 16, nullptr);
+}
+
+void LauncherApp::TickFade()
+{
+    if (!fading_ || !hwnd_)
+    {
+        KillTimer(hwnd_, 7);
+        return;
+    }
+
+    ULONGLONG elapsed = GetTickCount64() - fadeStart_;
+    double t = fadeDurationMs_ > 0 ? std::min(1.0, (double)elapsed / (double)fadeDurationMs_) : 1.0;
+    double eased = 1.0 - std::pow(1.0 - t, 2.0);
+    int alpha = fadeOut_ ? (int)(255.0 * (1.0 - eased)) : (int)(255.0 * eased);
+    if (alpha < 0) alpha = 0;
+    if (alpha > 255) alpha = 255;
+    SetLayeredWindowAttributes(hwnd_, 0, (BYTE)alpha, LWA_ALPHA);
+    fadeAlpha_ = (BYTE)alpha;
+
+    if (t >= 1.0)
+    {
+        fading_ = false;
+        KillTimer(hwnd_, 7);
+        if (fadeOut_)
+        {
+            fadeOut_ = false;
+            ShowWindow(hwnd_, SW_HIDE);
+            Log("hide (fade done)");
+        }
+    }
+}
+
 void LauncherApp::ShowLauncher()
 {
+    // 关闭动画进行中又被唤出：直接反向淡入，不再重走"抓背景 + 重排"
+    if (fading_ && fadeOut_)
+    {
+        StartFade(false);
+        return;
+    }
+
+    fading_ = false;
+    if (layered_ && hwnd_)
+    {
+        // 先透明，再显示：第一帧不会闪出"全亮的一下"，随后淡入
+        SetLayeredWindowAttributes(hwnd_, 0, 0, LWA_ALPHA);
+        fadeAlpha_ = 0;
+    }
+
     // 先抓背景再显示：窗口不可见时抓到的是干净的桌面（隐藏期间桌面可能已经变了）
     liveCapture_.DropReady();
     if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_))
@@ -1573,15 +1685,21 @@ void LauncherApp::ShowLauncher()
         backdrop_.CapturePixels(hwnd_, dpi_, settings_.blurRadius);
     }
 
-    ShowWindow(hwnd_, SW_SHOW);
+    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
     if (rendererReady_)
     {
         backdrop_.Upload(renderer_);
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
+
     SetForegroundWindow(hwnd_);
     if (searchEdit_) SetFocus(searchEdit_);
     ScheduleRepaint();
+
+    if (layered_)
+    {
+        StartFade(false);
+    }
     Log("show");
 }
 
@@ -1589,6 +1707,15 @@ void LauncherApp::HideLauncher()
 {
     if (windowResize_) StopWindowResize();
     if (windowDrag_) StopWindowDrag();
+
+    if (layered_ && IsWindowVisible(hwnd_) && !fading_)
+    {
+        // 关闭动画：淡出 180ms 再真正隐藏
+        StartFade(true);
+        Log("hide (fade start)");
+        return;
+    }
+
     ShowWindow(hwnd_, SW_HIDE);
     Log("hide");
 }
@@ -1972,6 +2099,11 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             if (w == 6) // TIMER_HOVER
             {
                 TickHoverAnimation();
+                return 0;
+            }
+            if (w == 7) // TIMER_FADE
+            {
+                TickFade();
                 return 0;
             }
             if (w == 4) // TIMER_AUTO_EXIT（测试用）
