@@ -160,11 +160,26 @@ $env:GL_NATIVE_PERF='1'
 - 实测：左边缘拖动 100px → 窗口 1050→1150、位置 755→655；双击标题 → `IsZoomed=True`、
   16 列布局、失效角标/拖入图标都正常（见 `docs/native-maximized.png`）。
 
-### 9.4 未完成 / 需要实机
+### 9.4 托盘 / 热键（沙箱外实测通过）
 
-- 托盘图标与全局热键：沙箱内低完整性进程加不了托盘，已通过 admin 网关申请沙箱外运行，
-  **审批弹窗 120s 超时未批**（网关状态显示无待审批）；需要在你在场时重试或你直接跑
-  `dist\native\GlassLauncherNative.exe` 验证；
+沙箱内低完整性进程加不了托盘，按用户要求通过 **admin 审批网关**在沙箱外跑了一次
+（`GL_NATIVE_EXIT_AFTER_MS=9000` 自动退出），日志确认：
+
+```
+tray added=1
+hotkey registered=1 mods=0x4001 vk=0x4A     # Alt+J（测试用独立数据目录，避开 WPF 实例的 Alt+G）
+startup window-ready 375 ms
+exclusion set=1
+auto exit / exit                            # 到期自动退出，没有残留进程
+```
+
+也就是说 `Shell_NotifyIcon` 和 `RegisterHotKey` 的真实路径是通的；托盘左键切换、右键菜单、
+热键触发的代码路径与日志已在 M1/M2 覆盖。
+
+### 9.5 未完成
+
 - Aero Snap（贴边分屏）仍未实现（非模态拖动/缩放的自然代价）；
-- 入场/退场动画、悬停放大、托盘/应用图标资源、暗色设置窗口仍待 M4。
+- 入场/退场动画、悬停放大、托盘/应用图标资源、暗色设置窗口仍待 M4；
+- 拖动中的背景更新实测约 40fps（窗口移动 63Hz、抓帧 13–17ms/帧），下一步评估
+  "两趟盒式模糊"或"隔帧更新"把 worker 成本再压一档。
 
