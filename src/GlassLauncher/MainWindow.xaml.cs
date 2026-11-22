@@ -21,6 +21,8 @@ namespace GlassLauncher;
 public partial class MainWindow : GlassWindow
 {
     private readonly ObservableCollection<AppEntry> _entries = new();
+    private readonly HashSet<Guid> _launching = new();   // 在途启动的条目：并发双击只启动一次
+    private int _statusToken;                            // 最新一次启动的令牌：旧结果不许改状态栏
     private readonly DispatcherTimer _statusTimer;
     private readonly DispatcherTimer _autoScrollTimer;
 
@@ -309,6 +311,8 @@ public partial class MainWindow : GlassWindow
     /// 全局快捷键注册（设置改了之后也会重新走这里）。
     /// MOD_NOREPEAT：按住不放只触发一次，不然按住 Ctrl+Alt+G 会疯狂开关窗口。
     /// </summary>
+    private string? _hotkeySignature;
+
     private void ApplyHotkeySetting()
     {
         IntPtr hwnd = _hwnd;
@@ -318,17 +322,32 @@ public partial class MainWindow : GlassWindow
             return;
         }
 
-        UnregisterHotKey(hwnd, HotkeyId);
-
         if (!HotkeyHelper.TryParse(_settings.Hotkey, out uint modifiers, out uint virtualKey))
         {
+            UnregisterHotKey(hwnd, HotkeyId);
+            _hotkeySignature = null;
             return;
         }
 
-        if (!RegisterHotKey(hwnd, HotkeyId, modifiers | HotkeyHelper.ModNoRepeat, virtualKey))
+        uint fsModifiers = modifiers | HotkeyHelper.ModNoRepeat;
+        string signature = $"{fsModifiers}:{virtualKey}";
+        if (signature == _hotkeySignature)
+        {
+            // 已按这组组合成功注册：不要为设置滑杆的每次 Commit 白解绑重绑
+            // （重绑有窗口期，可能被别的程序瞬时抢占，弹出假的"注册失败"）
+            return;
+        }
+
+        UnregisterHotKey(hwnd, HotkeyId);
+        _hotkeySignature = null;
+
+        if (!RegisterHotKey(hwnd, HotkeyId, fsModifiers, virtualKey))
         {
             ShowStatus($"快捷键 {_settings.Hotkey} 注册失败，可能被其他程序占用，可到设置里换一个");
+            return;
         }
+
+        _hotkeySignature = signature;
     }
 
     private const int HotkeyId = 0xC0DE; // 本窗口内唯一的热键 id
@@ -455,6 +474,7 @@ public partial class MainWindow : GlassWindow
     private bool _manualDrag;
     private NativePoint _manualDragCursorStart;
     private Point _manualDragWindowStart; // 拖动开始时窗口左上角（物理 px）
+    private long _manualDragStartTick;    // 看门狗用：本次拖动开始时刻（TickCount64，不受 live 启停影响）
     private DispatcherTimer? _manualDragTimer;
 
     /// <summary>
@@ -483,6 +503,7 @@ public partial class MainWindow : GlassWindow
 
         _manualDragWindowStart = new Point(rect.Left, rect.Top);
         _manualDrag = true;
+        _manualDragStartTick = Environment.TickCount64;
         _inModalMove = true; // 与模态拖动一致：让 RefreezeSoon/FreezeBackdrop 让路
         Diag.Log($"manual drag start rect=({rect.Left},{rect.Top})");
         _ = ReleaseWin32Capture();
@@ -511,8 +532,10 @@ public partial class MainWindow : GlassWindow
         }
 
         // 兜底：万一按键状态卡住（UAC 抢焦点、鼠标抬起发生在别的桌面等），
-        // 最多拖 60 秒就强行收尾，绝不能把 live 抓屏循环永久留在 60Hz 空转
-        if (_liveClock.IsRunning && _liveClock.Elapsed.TotalSeconds > 60)
+        // 最多拖 60 秒就强行收尾，绝不能把 live 抓屏循环永久留在 60Hz 空转。
+        // 用本次拖动的起始时刻判断，而不是 live 计时表 —— StartDragRide 有几条提前返回
+        // （排除 API 失败等）不会 Restart 那张表，那样会在第一次 tick 就误判成超时。
+        if (Environment.TickCount64 - _manualDragStartTick > 60_000)
         {
             Diag.Log("manual drag watchdog fired (>60s)");
             EndManualDrag();
@@ -540,6 +563,7 @@ public partial class MainWindow : GlassWindow
 
         _manualDrag = false;
         _manualDragTimer?.Stop();
+        _liveClock.Stop();
         _inModalMove = false;
 
         // 松手：模糊半径恢复用户设定值
@@ -593,7 +617,7 @@ public partial class MainWindow : GlassWindow
     /// 轮询会继续给一个隐藏的窗口改位置，`_inModalMove` 也会卡在 true，
     /// 让之后的 RefreezeSoon/FreezeBackdrop 永远让路（背景停在旧位置）。
     /// </summary>
-    private void AbortWindowDrag(string reason)
+    private void AbortWindowDrag(string reason, bool refreeze = true)
     {
         if (!_manualDrag)
         {
@@ -603,6 +627,7 @@ public partial class MainWindow : GlassWindow
         Diag.Log($"window drag aborted reason={reason}");
         _manualDrag = false;
         _manualDragTimer?.Stop();
+        _liveClock.Stop();
         _inModalMove = false;
 
         if (_liveGrabActive)
@@ -617,6 +642,14 @@ public partial class MainWindow : GlassWindow
 
         ClearFrozenShift();
 
+        // 窗口仍然可见的收尾路径（失活、双击标题、状态变化）：最后一帧 live 是按旧位置
+        // 对齐的，清掉偏移后背景相对桌面会平移，必须立刻重抓一帧把内容钉回屏幕。
+        // 隐藏/关闭路径传 refreeze:false（马上看不见，抓了也是浪费）。
+        if (refreeze && IsVisible && !_exiting)
+        {
+            _surfaceFresh = false;
+            FreezeBackdrop();
+        }
     }
 
     /// <summary>
@@ -810,7 +843,7 @@ public partial class MainWindow : GlassWindow
     /// 【当前】窗口原点来算，不能用"上一帧的位移量"——后者符号是反的（窗口往右走，
     /// 内容要往左补），会把背景推成两帧滞后，松手对齐的那一刻再跳回来。
     /// </summary>
-    private void OnLiveFrameReady(WriteableBitmap bitmap, Point originPx, DpiScale dpi)
+    private void OnLiveFrameReady(WriteableBitmap bitmap, Point originPx, int sourceWidth, int sourceHeight, DpiScale dpi)
     {
         if (!_liveGrabActive)
         {
@@ -851,10 +884,11 @@ public partial class MainWindow : GlassWindow
         _livePrevOrigin = originPx;
 
         // 记录"已上屏背景"的几何：松手后同位置的补帧可以直接跳过（见 FreezeBackdrop）。
-        // 这里记的是【满分辨率物理像素】几何，和抓屏请求的判定口径一致。
+        // 这里必须用【抓取请求】时的满分辨率尺寸，而不是上屏这一刻的 ActualWidth/Height ——
+        // 拖动中跨 DPI 显示器时两者会不一致，记账错会让后续补帧被错误地去重跳过。
         _lastSurfaceOrigin = originPx;
-        _lastSurfaceWidth = (int)Math.Ceiling((ActualWidth + (BackdropPad * 2)) * dpiNow.DpiScaleX);
-        _lastSurfaceHeight = (int)Math.Ceiling((ActualHeight + (BackdropPad * 2)) * dpiNow.DpiScaleY);
+        _lastSurfaceWidth = sourceWidth;
+        _lastSurfaceHeight = sourceHeight;
         _surfaceFresh = true;
 
         double ms = _liveGrab!.LastGrabMs;
@@ -990,7 +1024,7 @@ public partial class MainWindow : GlassWindow
         Closed += (_, _) =>
         {
             ClearDragFlags();
-            AbortWindowDrag("closed");
+            AbortWindowDrag("closed", refreeze: false);
             _hwnd = IntPtr.Zero;
             _surfaceFresh = false;
             _liveGrab?.Dispose();
@@ -1244,6 +1278,10 @@ public partial class MainWindow : GlassWindow
 
         _freezeBusy = true;
 
+        // 必须在任何 await 之前取代数：若在 60ms 排除等待之后才取，
+        // "等待期间开始拖动"就抓不到作废（拖动只在左上角不变时才会漏网）。
+        int generation = _captureGeneration;
+
         try
         {
             // 以实查结果为准补开排除（顺带修掉"以为开着其实没开"的日志盲区）
@@ -1270,8 +1308,6 @@ public partial class MainWindow : GlassWindow
                     return;
                 }
             }
-
-            int generation = _captureGeneration;
 
             DpiScale dpi = VisualTreeHelper.GetDpi(this);
             Point origin = PointToScreen(new Point(0, 0));
@@ -1323,20 +1359,31 @@ public partial class MainWindow : GlassWindow
 
             _freezePixels = pixels;
 
-            if (_hwnd == IntPtr.Zero || !IsVisible || generation != _captureGeneration)
+            // 抓取期间窗口被隐藏/关闭、拖动/缩放开始、或尺寸变了：这帧作废。
+            // （_inModalMove 也要查：缩放从右下角拉时窗口左上角不变，仅靠 origin 复查会漏网）
+            DpiScale dpiAfter = VisualTreeHelper.GetDpi(this);
+            int nowFullWidth = (int)Math.Ceiling((ActualWidth + (BackdropPad * 2)) * dpiAfter.DpiScaleX);
+            int nowFullHeight = (int)Math.Ceiling((ActualHeight + (BackdropPad * 2)) * dpiAfter.DpiScaleY);
+            bool stale = _hwnd == IntPtr.Zero || !IsVisible
+                || generation != _captureGeneration
+                || _inModalMove
+                || nowFullWidth != fullWidth
+                || nowFullHeight != fullHeight
+                || PointToScreen(new Point(0, 0)) != origin;
+
+            if (stale)
             {
-                // 抓取期间窗口被隐藏/关闭，或拖动开始了：这帧作废（位置是过时的）
                 Diag.Log(generation != _captureGeneration
                     ? "freeze result discarded (drag started mid-capture)"
-                    : "freeze aborted (window hidden/closed during capture)");
-                return;
-            }
+                    : "freeze result discarded (geometry/visibility changed mid-capture)");
 
-            // 抓取期间窗口又动了？那就说明这帧已经过时，交给下一轮补帧（几何变了）
-            if (PointToScreen(new Point(0, 0)) != origin)
-            {
-                _freezeQueued = true;
-                _freezeQueuedInstant |= instant;
+                // 窗口还可见、只是几何变了：排一次补抓（隐藏/关闭就不要再排了）
+                if (IsVisible && _hwnd != IntPtr.Zero)
+                {
+                    _freezeQueued = true;
+                    _freezeQueuedInstant |= instant;
+                }
+
                 return;
             }
 
@@ -1639,7 +1686,7 @@ public partial class MainWindow : GlassWindow
         }
 
         // 手动拖动期间隐藏：先把手势收掉，否则隐藏的窗口会继续跟着鼠标跑
-        AbortWindowDrag("hide to tray");
+        AbortWindowDrag("hide to tray", refreeze: false);
         CancelGesture();
 
         // 隐藏期间桌面可能变化，唤出时必须重抓一帧（几何没变也要抓）
@@ -2003,8 +2050,8 @@ public partial class MainWindow : GlassWindow
     {
         List<AppEntry> loaded = LauncherStore.Load(out string? error);
 
-        // 图标解码并行做（40 个条目串行解码实测多吃 340ms 启动时间），
-        // 结果统一在这里（UI 线程）赋给条目
+        // 图标解码刻意在 UI 线程串行做（IconService.Prepare 的注释有实测依据：
+        // 丢到 Parallel.For 反而慢几十倍），这里只是把结果统一赋给条目。
         IconService.Prepare(loaded);
 
         foreach (AppEntry entry in loaded)
@@ -2741,8 +2788,16 @@ public partial class MainWindow : GlassWindow
     /// </summary>
     private async void LaunchEntry(AppEntry entry, bool asAdministrator)
     {
+        // 同一入口并发双击：只启动一次（旧实现是同步的，UI 串行化了它；
+        // 改 async 之后两次点击会在 await 前并行，必须显式去重）
+        if (!_launching.Add(entry.Id))
+        {
+            return;
+        }
+
         // 先给确认反馈再真正启动
         PlayLaunchBounce(entry);
+        int token = ++_statusToken;
 
         LaunchResult result = LaunchResult.Failed;
         string? error = null;
@@ -2760,6 +2815,16 @@ public partial class MainWindow : GlassWindow
             error = $"{ex.GetType().Name}: {ex.Message}";
             Diag.Log($"LaunchEntry 失败：{error}");
         }
+        finally
+        {
+            _launching.Remove(entry.Id);
+        }
+
+        // 只有最新一次启动能改状态栏：慢成功不能把后一次失败/取消的提示清掉
+        if (token != _statusToken)
+        {
+            return;
+        }
 
         switch (result)
         {
@@ -2773,8 +2838,13 @@ public partial class MainWindow : GlassWindow
                 break;
 
             default:
-                entry.IsBroken = true;
-                Persist();
+                // 条目可能在启动过程中被改名/移除：只在它仍属于当前列表时才标记失效
+                if (_entries.Contains(entry))
+                {
+                    entry.IsBroken = true;
+                    Persist();
+                }
+
                 ShowStatus($"启动失败：{entry.DisplayName} — {error}");
                 break;
         }

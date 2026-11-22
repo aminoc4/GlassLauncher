@@ -4,6 +4,7 @@ using System.IO;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Threading;
 using GlassLauncher.Models;
 using GlassLauncher.Services;
 
@@ -19,6 +20,10 @@ public partial class SettingsDialog : Chrome.GlassWindow
     private readonly LauncherSettings _settings;
     private readonly Action<LauncherSettings> _onChanged;
 
+    // 滑杆防抖：从 15 拖到 120 会触发 ~21 次 ValueChanged，逐 tick 落盘 + 重注册热键
+    // 既浪费又可能撞上"热键被瞬时抢占"的假失败。拖动中只刷新标签，停手 250ms 后再提交。
+    private readonly DispatcherTimer _commitDelay;
+
     // 控件初始化会触发 Checked/ValueChanged，用这个标记挡住“加载即保存”的回环
     private bool _loading;
 
@@ -31,8 +36,25 @@ public partial class SettingsDialog : Chrome.GlassWindow
         _onChanged = onChanged;
         _loading = true;
 
+        _commitDelay = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _commitDelay.Tick += (_, _) =>
+        {
+            _commitDelay.Stop();
+            Commit();
+        };
+
         InitializeComponent();
         _loading = false;
+
+        // 关闭窗口时把还没落盘的最后一次改动补上
+        Closed += (_, _) =>
+        {
+            if (_commitDelay.IsEnabled)
+            {
+                _commitDelay.Stop();
+                Commit();
+            }
+        };
 
         VersionText.Text = "Glass Launcher v"
             + (Assembly.GetExecutingAssembly().GetName().Version is { } v
@@ -115,7 +137,7 @@ public partial class SettingsDialog : Chrome.GlassWindow
         }
 
         _settings.BlurRadius = e.NewValue;
-        Commit();
+        ScheduleCommit();
     }
 
     /// <summary>抓屏速率：拖动时背景每秒抓几帧（15–120）。</summary>
@@ -134,7 +156,14 @@ public partial class SettingsDialog : Chrome.GlassWindow
         }
 
         _settings.CaptureFps = e.NewValue;
-        Commit();
+        ScheduleCommit();
+    }
+
+    /// <summary>滑杆专用：停手 250ms 再落盘/应用，拖动过程中不反复写文件、不反复重注册热键。</summary>
+    private void ScheduleCommit()
+    {
+        _commitDelay.Stop();
+        _commitDelay.Start();
     }
 
     private void OnReduceBlurChanged(object sender, RoutedEventArgs e)

@@ -57,10 +57,10 @@
               Visibility="Collapsed">
             <!--
                 半分辨率层：布局尺寸是"窗口 + 两侧垫边"的一半，再用 ScaleTransform(2) 放大回窗口。
-                WPF 的 Effect 是在元素的布局空间里栅格化的，中间表面（高斯的多趟中间位图）
-                面积因此只有满分辨率的 1/4 —— 实测满分辨率下两个 BlurEffect 吃掉 83MB 私有内存，
-                是整个程序最大的单项开销（WPF 运行时本身约 60MB）。
-                背景本来就是糊的，2 倍上采样看不出来；模糊半径相应减半，视觉上仍是 12 DIP。
+                WPF 的 Effect 在元素的布局空间里栅格化，中间表面（高斯的多趟中间位图）
+                面积因此只有满分辨率的 1/4 —— 收益在 GPU 填充率/纹理带宽，不在内存：
+                同机实测"满分辨率两个 BlurEffect 吃 83MB"不成立（整个背景栈约 5MB，
+                见 MEASUREMENTS.md）。模糊半径相应减半，视觉上仍是 12 DIP。
                 Width/Height 由代码按窗口尺寸设置（见 UpdateFrozenLayerLayout）。
                 注意 Margin 必须保持 -48（布局位置不会被自己的 RenderTransform 缩放，
                 只有尺寸会），放大后正好覆盖"窗口 + 四周 48 DIP"。

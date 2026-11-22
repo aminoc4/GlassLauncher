@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Text;
 
 namespace GlassLauncher.Chrome;
 
@@ -56,6 +57,9 @@ internal static class Diag
         {
             string line = string.Concat(DateTime.Now.ToString("HH:mm:ss.fff"), "  ", message, Environment.NewLine);
 
+            // 上限按 UTF-8 字节算（日志里有大量中文，按字符算会导致实际文件 1.5–3 倍于上限）
+            int bytes = Encoding.UTF8.GetByteCount(line);
+
             lock (Gate)
             {
                 if (!_sizeKnown)
@@ -64,11 +68,30 @@ internal static class Diag
                     _writtenBytes = new FileInfo(LogPath) is { Exists: true } info ? info.Length : 0;
                 }
 
-                if (_writtenBytes + line.Length > MaxLogBytes)
+                if (_writtenBytes + bytes > MaxLogBytes)
                 {
                     Rotate();
                 }
 
+                AppendWithRetry(line, bytes);
+            }
+        }
+        catch
+        {
+            // 诊断日志失败不影响主流程
+        }
+    }
+
+    /// <summary>
+    /// 写一行并累计字节数。目录缓存失效（运行中被清理、权限瞬变）时重建目录重试一次，
+    /// 不能因为一次 DirectoryNotFoundException 就让之后的日志永久静默。
+    /// </summary>
+    private static void AppendWithRetry(string line, int bytes)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
                 if (!_directoryReady)
                 {
                     string? dir = Path.GetDirectoryName(LogPath);
@@ -81,12 +104,13 @@ internal static class Diag
                 }
 
                 File.AppendAllText(LogPath, line);
-                _writtenBytes += line.Length;
+                _writtenBytes += bytes;
+                return;
             }
-        }
-        catch
-        {
-            // 诊断日志失败不影响主流程
+            catch (Exception ex) when (attempt == 0 && (ex is IOException or UnauthorizedAccessException))
+            {
+                _directoryReady = false;
+            }
         }
     }
 

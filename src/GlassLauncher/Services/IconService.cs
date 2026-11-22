@@ -31,16 +31,15 @@ public static class IconService
     private const int RequestedSize = 256;
 
     /// <summary>
-    /// 解码上限（像素）。缓存里的 PNG 是 256px，全尺寸解码后每个图标占 256×256×4 ≈ 250KB，
-    /// 40 个条目就是 10MB+；而界面最大只画到 56 DIP（悬停放大 10% → 62 DIP，
-    /// 200% DPI 下 123px）。96px 解码足够清晰（对 70px 显示约 1.37×，不超过 1.5× 过采样上限），
-    /// 内存降到约 1/7，解码也更快。小图（原本就 ≤96）保持原样，不做无谓的放大。
+    /// 解码上限（像素）。缓存里的 PNG 是 256px；界面显示 56 DIP（悬停放大 1.10 → 61.6 DIP），
+    /// 200% DPI 下需要 123px，所以 128px 是"覆盖到 ~208% DPI"的安全值；96px 在 175%/200%
+    /// 会系统性欠采样，图标发软（实测省下的 2–3MB 不值得）。
+    /// 小图（原本就 ≤128）保持原样，不做无谓的放大。
     /// </summary>
-    private const int MaxDecodeSize = 96;
+    private const int MaxDecodeSize = 128;
 
     private static readonly string CacheDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "GlassLauncher",
+        LauncherStore.DataDirectory,
         "icons");
 
     /// <summary>
@@ -457,8 +456,8 @@ public static class IconService
         {
             using FileStream stream = File.OpenRead(path);
             Span<byte> header = stackalloc byte[24];
-            if (stream.Read(header) != header.Length
-                || header[0] != 0x89 || header[1] != 0x50 || header[2] != 0x4E || header[3] != 0x47)
+            stream.ReadExactly(header);
+            if (header[0] != 0x89 || header[1] != 0x50 || header[2] != 0x4E || header[3] != 0x47)
             {
                 return null;
             }

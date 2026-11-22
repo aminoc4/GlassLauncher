@@ -43,8 +43,9 @@ internal static class ScreenGrab
     ///
     /// 返回值尺寸是 <paramref name="destWidth"/> × <paramref name="destHeight"/>：
     /// 源矩形用 StretchBlt 直接缩放到目标尺寸（HALFTONE，按面积平均，不是点采样）。
-    /// 背景层用 1/2 分辨率抓，模糊的中间表面面积就只剩 1/4 —— 满分辨率下两个 BlurEffect
-    /// 要吃掉 83MB 私有内存，是程序最大的单项开销。
+    /// 背景层按 1/2 分辨率抓，抓屏/上传量与模糊中间表面都降到 1/4。
+    /// （历史注释里"满分辨率下两个 BlurEffect 吃掉 83MB"已被同机实测推翻：
+    ///   整个背景栈约 5MB，见 MEASUREMENTS.md。这里保留降采样是因为带宽/填充率。）
     ///
     /// patchAlpha=false 时跳过"把 alpha 全刷成 255"的全图循环，调用方必须用
     /// <see cref="PixelFormats.Bgr32"/> 上屏（alpha 被忽略，效果等价）。
@@ -63,9 +64,14 @@ internal static class ScreenGrab
         bool patchAlpha = true,
         byte[]? buffer = null)
     {
+        // 面积守卫要按【目标】算（内存由 dest 决定）；源只做一个防呆上限
+        // （6K@200% 全屏最大化约 6000×3400，仍远低于 64M 像素）。
+        // 旧实现守的是 source 面积，降采样后会出现"live 正常、静态冻结静默失败"。
         if (sourceWidth <= 0 || sourceHeight <= 0 || destWidth <= 0 || destHeight <= 0
-            || (long)sourceWidth * sourceHeight > 12_000_000)
+            || (long)sourceWidth * sourceHeight > 64_000_000
+            || (long)destWidth * destHeight > 12_000_000)
         {
+            Diag.Log($"Capture 拒绝：src={sourceWidth}x{sourceHeight} dest={destWidth}x{destHeight}");
             return null;
         }
 

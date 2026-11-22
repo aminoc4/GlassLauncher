@@ -32,11 +32,14 @@ public class LauncherSettings
     public double CaptureFps { get; set; } = 60;
 
     /// <summary>
-    /// 拖动时临时把模糊半径降到 60%。
-    /// 模糊是每帧重算的大头，弱 GPU / 软件渲染下把半径降下来能明显减少掉帧，
-    /// 而且快速拖动时人眼分辨不出半径差异。
+    /// 拖动时临时把模糊半径降到 60%。默认关闭。
+    ///
+    /// ⚠ 它是一个视觉跳变源：拖动中是 0.6×半径，松手瞬间 ApplyBlurRadius 恢复全半径，
+    /// 紧接着就是"原子换帧"的静态帧 —— 换帧前后模糊浓度不同，整片背景会突然糊一档，
+    /// 与"松手零闪烁"这条硬性要求直接冲突。实测拖动瓶颈也不在模糊（BitBlt 13–15ms），
+    /// 所以只在软件渲染/弱 GPU 的机器上建议手动打开。
     /// </summary>
-    public bool ReduceBlurWhileDragging { get; set; } = true;
+    public bool ReduceBlurWhileDragging { get; set; }
 
     /// <summary>窗口置顶（启动器类应用的常见需求）。</summary>
     public bool Topmost { get; set; }

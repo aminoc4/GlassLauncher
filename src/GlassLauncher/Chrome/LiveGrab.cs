@@ -77,10 +77,10 @@ internal sealed class LiveGrab : IDisposable
     public double LastGrabMs { get; private set; }
 
     /// <summary>
-    /// 一帧就绪（UI 线程回调）：参数为上好屏的位图、这帧抓取时窗口原点（物理 px）
-    /// 和 DPI —— 回调里用前后两帧原点差做位移预测。
+    /// 一帧就绪（UI 线程回调）：上好屏的位图、这帧抓取时窗口原点（物理 px）、
+    /// 抓取源区域的满分辨率尺寸（物理 px，用于几何记账）和 DPI。
     /// </summary>
-    public event Action<WriteableBitmap, Point, DpiScale>? FrameReady;
+    public event Action<WriteableBitmap, Point, int, int, DpiScale>? FrameReady;
 
     public LiveGrab()
     {
@@ -258,7 +258,11 @@ internal sealed class LiveGrab : IDisposable
             var capturedDpi = new DpiScale(dpiX, dpiY);
             int capturedWidth = _width;
             int capturedHeight = _height;
-            _dispatcher.BeginInvoke(() => UploadAndRaise(buffer, capturedWidth, capturedHeight, capturedOrigin, capturedDpi));
+            int capturedSourceWidth = sourceW;
+            int capturedSourceHeight = sourceH;
+            _dispatcher.BeginInvoke(() => UploadAndRaise(
+                buffer, capturedWidth, capturedHeight, capturedSourceWidth, capturedSourceHeight,
+                capturedOrigin, capturedDpi));
         }
 
         ReleaseGdi();
@@ -276,7 +280,8 @@ internal sealed class LiveGrab : IDisposable
     }
 
     /// <summary>UI 线程：把像素写进 WriteableBitmap、归还缓冲，然后通知订阅者。</summary>
-    private void UploadAndRaise(byte[] pixels, int width, int height, Point originPx, DpiScale dpi)
+    private void UploadAndRaise(byte[] pixels, int width, int height, int sourceWidth, int sourceHeight,
+        Point originPx, DpiScale dpi)
     {
         WriteableBitmap? bitmap = _bitmap;
 
@@ -296,7 +301,7 @@ internal sealed class LiveGrab : IDisposable
             _spareBuffers.Enqueue(pixels);
         }
 
-        FrameReady?.Invoke(bitmap, originPx, dpi);
+        FrameReady?.Invoke(bitmap, originPx, sourceWidth, sourceHeight, dpi);
     }
 
     /// <summary>工作线程重建 GDI 资源（尺寸精确等于请求区域）。失败返回 false。</summary>
