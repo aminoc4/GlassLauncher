@@ -8,6 +8,7 @@
 
 #include "renderer.h"
 #include "backdrop.h"
+#include "livecapture.h"
 #include "store.h"
 
 namespace gl {
@@ -23,6 +24,7 @@ private:
     HWND hwnd_ = nullptr;
     Renderer renderer_;
     Backdrop backdrop_;
+    LiveCapture liveCapture_;
     ThemeColors colors_;
     float dpi_ = 1.0f;
     float widthDip_ = 840.0f;
@@ -55,11 +57,29 @@ private:
     POINT dragCursorStart_ = {};
     RECT dragWindowStart_ = {};
     UINT_PTR dragTimer_ = 0;
+
+    // 非模态边缘缩放（同样绕开 WM_ENTERSIZEMOVE：排除+模态循环在本机 build 26300 会让 DWM 停画）
+    bool windowResize_ = false;
+    int resizeHit_ = 0;
+    POINT resizeCursorStart_ = {};
+    RECT resizeRectStart_ = {};
+    UINT_PTR resizeTimer_ = 0;
     ULONGLONG lastLiveTick_ = 0;
     int liveFrames_ = 0;
+    int windowTicks_ = 0;
     double liveTotalMs_ = 0;
     double liveCaptureMs_ = 0;
     double liveUploadMs_ = 0;
+
+    // 自动化回归：GL_NATIVE_AUTODRAG="dx,dy,durationMs,repeats,gapMs"（仅测试用）
+    bool autoDrag_ = false;
+    ULONGLONG autoDragStart_ = 0;
+    int autoDx_ = 0;
+    int autoDy_ = 0;
+    int autoDurationMs_ = 1500;
+    int autoRepeat_ = 1;
+    int autoGapMs_ = 700;
+    bool autoDragPending_ = false;
     float scroll_ = 0.0f;
     bool showStatus_ = false;
     std::wstring statusText_;
@@ -99,6 +119,7 @@ private:
 
     void RebuildBackdrop();
     void RecaptureBackdrop(bool live);
+    void OnLiveCaptureReady();
     void ScheduleRepaint();
     void UpdateWindowRegion();
 
@@ -127,6 +148,13 @@ private:
     void StartWindowDrag();
     void StopWindowDrag();
     void TickWindowDrag();
+    void StartWindowResize(int hit);
+    void StopWindowResize();
+    void TickWindowResize();
+    void ToggleMaximize();
+    void MaybeSubmitLiveFrame();
+    void ScheduleAutoDrag(int delayMs);
+    void StartAutoDrag();
 
     void ToggleVisible();
     void ShowLauncher();

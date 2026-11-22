@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <algorithm>
 
 #pragma comment(lib, "d2d1.lib")
@@ -562,9 +563,9 @@ int LauncherApp::Run(HINSTANCE instance)
         return 1;
     }
     rendererReady_ = true;
+    liveCapture_.Start(hwnd_);
 
     LoadIcons();
-    backdrop_.Upload(renderer_);
 
     wchar_t dumpPath[MAX_PATH] = {};
     DWORD dumpLen = GetEnvironmentVariableW(L"GL_NATIVE_DUMP_BACKDROP", dumpPath, MAX_PATH);
@@ -573,6 +574,7 @@ int LauncherApp::Run(HINSTANCE instance)
         Log("backdrop dump %ls ok=%d", dumpPath, backdrop_.DumpBmp(dumpPath) ? 1 : 0);
     }
 
+    backdrop_.Upload(renderer_);
     InvalidateRect(hwnd_, nullptr, TRUE);
 
     InitTray();
@@ -587,6 +589,27 @@ int LauncherApp::Run(HINSTANCE instance)
 
     Log("startup window-ready %llu ms", GetTickCount64() - startTick_);
 
+    // 自动化回归入口（仅测试用，不影响正常启动）
+    wchar_t autoDragSpec[128] = {};
+    if (GetEnvironmentVariableW(L"GL_NATIVE_AUTODRAG", autoDragSpec, 128) > 0)
+    {
+        if (swscanf(autoDragSpec, L"%d,%d,%d,%d,%d",
+                &autoDx_, &autoDy_, &autoDurationMs_, &autoRepeat_, &autoGapMs_) < 2)
+        {
+            autoDx_ = 200;
+            autoDy_ = 80;
+        }
+        ScheduleAutoDrag(1200);
+    }
+
+    // 自动化测试：到期自动退出（避免测试进程留在用户桌面上）
+    int exitAfterMs = 0;
+    if (GetEnvironmentVariableW(L"GL_NATIVE_EXIT_AFTER_MS", autoDragSpec, 128) > 0 &&
+        swscanf(autoDragSpec, L"%d", &exitAfterMs) == 1 && exitAfterMs > 0)
+    {
+        SetTimer(hwnd_, 4 /* TIMER_AUTO_EXIT */, (UINT)exitAfterMs, nullptr);
+    }
+
     MSG msg = {};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
@@ -596,6 +619,9 @@ int LauncherApp::Run(HINSTANCE instance)
 
     if (hotkeyOk_) UnregisterHotKey(hwnd_, HOTKEY_ID);
     RemoveTray();
+    liveCapture_.Stop();
+    if (searchFont_) { DeleteObject(searchFont_); searchFont_ = nullptr; }
+    if (searchBackBrush_) { DeleteObject(searchBackBrush_); searchBackBrush_ = nullptr; }
     if (rendererReady_)
     {
         for (auto* icon : icons_) if (icon) icon->Release();
@@ -793,7 +819,23 @@ void LauncherApp::DrawBackdrop()
 
     if (backdrop_.Valid())
     {
-        D2D1_RECT_F dest = D2D1::RectF(-PadDip, -PadDip, widthDip_ + PadDip, heightDip_ + PadDip);
+        // 实时帧是在"抓取那一刻"的窗口位置抓的；窗口之后又动了，就按差值平移，
+        // 保证背景内容始终钉在桌面对应位置上（而不是贴死在窗口上）。
+        float shiftX = 0.0f;
+        float shiftY = 0.0f;
+        if (backdrop_.HasOrigin())
+        {
+            RECT wr = {};
+            GetWindowRect(hwnd_, &wr);
+            shiftX = (float)(backdrop_.OriginX() - wr.left) / dpi_;
+            shiftY = (float)(backdrop_.OriginY() - wr.top) / dpi_;
+        }
+
+        float bitmapWidth = (float)backdrop_.WidthPx() * Backdrop::Downscale / dpi_;
+        float bitmapHeight = (float)backdrop_.HeightPx() * Backdrop::Downscale / dpi_;
+        D2D1_RECT_F dest = D2D1::RectF(
+            -PadDip + shiftX, -PadDip + shiftY,
+            -PadDip + shiftX + bitmapWidth, -PadDip + shiftY + bitmapHeight);
         rt->DrawBitmap(backdrop_.Bitmap(), dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
     else
@@ -1017,12 +1059,39 @@ void LauncherApp::RebuildBackdrop()
     RecaptureBackdrop(false);
 }
 
+void LauncherApp::OnLiveCaptureReady()
+{
+    const uint32_t* pixels = nullptr;
+    int width = 0;
+    int height = 0;
+    POINT origin = {};
+
+    if (!liveCapture_.TakeReady(&pixels, &width, &height, &origin)) return;
+
+    if (backdrop_.AdoptPixels(pixels, width, height, origin.x, origin.y, renderer_))
+    {
+        liveFrames_++;
+        liveTotalMs_ += (double)liveCapture_.LastGrabMs();
+    }
+
+    liveCapture_.ReleaseBuffer();
+    ScheduleRepaint();
+}
+
 void LauncherApp::UpdateWindowRegion()
 {
     if (!hwnd_) return;
     RECT rc = {};
     GetClientRect(hwnd_, &rc);
     if (rc.right <= 0 || rc.bottom <= 0) return;
+
+    // 最大化时由 DWM 负责（直角），自绘圆角区域要清掉，否则四角会露出桌面
+    if (IsZoomed(hwnd_))
+    {
+        SetWindowRgn(hwnd_, nullptr, TRUE);
+        return;
+    }
+
     int radius = (int)(16.0f * dpi_);
     HRGN region = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, radius * 2, radius * 2);
     if (region)
@@ -1141,6 +1210,7 @@ void LauncherApp::StartWindowDrag()
     windowDrag_ = true;
     lastLiveTick_ = 0;
     liveFrames_ = 0;
+    windowTicks_ = 0;
     liveTotalMs_ = 0;
     GetCursorPos(&dragCursorStart_);
     GetWindowRect(hwnd_, &dragWindowStart_);
@@ -1148,9 +1218,35 @@ void LauncherApp::StartWindowDrag()
     SetCapture(hwnd_);
 }
 
+void LauncherApp::MaybeSubmitLiveFrame()
+{
+    ULONGLONG now = GetTickCount64();
+    if (now - lastLiveTick_ >= 16)
+    {
+        lastLiveTick_ = now;
+        liveCapture_.Submit(hwnd_, dpi_, settings_.blurRadius);
+    }
+}
+
 void LauncherApp::TickWindowDrag()
 {
     if (!windowDrag_) return;
+    windowTicks_++;
+
+    if (autoDrag_)
+    {
+        ULONGLONG elapsed = GetTickCount64() - autoDragStart_;
+        double t = autoDurationMs_ > 0 ? std::min(1.0, (double)elapsed / autoDurationMs_) : 1.0;
+        double ease = 1.0 - std::pow(1.0 - t, 2.2);
+        SetWindowPos(hwnd_, nullptr,
+            dragWindowStart_.left + (int)(autoDx_ * ease),
+            dragWindowStart_.top + (int)(autoDy_ * ease), 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        MaybeSubmitLiveFrame();
+        if (t >= 1.0) StopWindowDrag();
+        return;
+    }
+
     POINT p = {};
     GetCursorPos(&p);
     int dx = p.x - dragCursorStart_.x;
@@ -1158,23 +1254,103 @@ void LauncherApp::TickWindowDrag()
     SetWindowPos(hwnd_, nullptr, dragWindowStart_.left + dx, dragWindowStart_.top + dy, 0, 0,
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
-    // 拖动中实时背景：约 60fps 抓一帧（抓屏+模糊 ~6–10ms，8ms 的计时器节拍下会自然降到 ~40–60fps）。
-    // 这样窗口移动时背景是"桌面跟着流动"，而不是一张贴死在窗口上的旧图。
-    ULONGLONG now = GetTickCount64();
-    if (now - lastLiveTick_ >= 16)
-    {
-        lastLiveTick_ = now;
-        ULONGLONG t0 = GetTickCount64();
-        RecaptureBackdrop(true);
-        liveTotalMs_ += (double)(GetTickCount64() - t0);
-        liveFrames_++;
-        ScheduleRepaint();
-    }
+    MaybeSubmitLiveFrame();
 
     if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0)
     {
         StopWindowDrag();
     }
+}
+
+void LauncherApp::StartWindowResize(int hit)
+{
+    if (windowResize_ || windowDrag_) return;
+    windowResize_ = true;
+    resizeHit_ = hit;
+    GetCursorPos(&resizeCursorStart_);
+    GetWindowRect(hwnd_, &resizeRectStart_);
+    SetCapture(hwnd_);
+    resizeTimer_ = SetTimer(hwnd_, 5 /* TIMER_RESIZE */, 8, nullptr);
+    Log("window resize start hit=%d", hit);
+}
+
+void LauncherApp::TickWindowResize()
+{
+    if (!windowResize_) return;
+
+    POINT p = {};
+    GetCursorPos(&p);
+    int dx = p.x - resizeCursorStart_.x;
+    int dy = p.y - resizeCursorStart_.y;
+
+    RECT r = resizeRectStart_;
+    if (resizeHit_ & 1) r.left += dx;
+    if (resizeHit_ & 2) r.right += dx;
+    if (resizeHit_ & 4) r.top += dy;
+    if (resizeHit_ & 8) r.bottom += dy;
+
+    int minW = (int)(680.0f * dpi_);
+    int minH = (int)(460.0f * dpi_);
+    if (r.right - r.left < minW)
+    {
+        if (resizeHit_ & 1) r.left = r.right - minW;
+        else r.right = r.left + minW;
+    }
+    if (r.bottom - r.top < minH)
+    {
+        if (resizeHit_ & 4) r.top = r.bottom - minH;
+        else r.bottom = r.top + minH;
+    }
+
+    SetWindowPos(hwnd_, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    MaybeSubmitLiveFrame();
+
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0)
+    {
+        StopWindowResize();
+    }
+}
+
+void LauncherApp::StopWindowResize()
+{
+    if (!windowResize_) return;
+    windowResize_ = false;
+    if (resizeTimer_) { KillTimer(hwnd_, 5); resizeTimer_ = 0; }
+    ReleaseCapture();
+    Log("window resize end");
+    RebuildBackdrop();
+    ScheduleRepaint();
+}
+
+void LauncherApp::ToggleMaximize()
+{
+    Log("toggle maximize zoomed=%d", IsZoomed(hwnd_) ? 1 : 0);
+    if (IsZoomed(hwnd_)) ShowWindow(hwnd_, SW_RESTORE);
+    else ShowWindow(hwnd_, SW_MAXIMIZE);
+    UpdateWindowRegion();
+    RebuildBackdrop();
+    ScheduleRepaint();
+}
+
+void LauncherApp::ScheduleAutoDrag(int delayMs)
+{
+    SetTimer(hwnd_, 3 /* TIMER_AUTODRAG */, (UINT)std::max(1, delayMs), nullptr);
+}
+
+void LauncherApp::StartAutoDrag()
+{
+    Log("autodrag start dx=%d dy=%d dur=%d repeat=%d", autoDx_, autoDy_, autoDurationMs_, autoRepeat_);
+    autoDrag_ = true;
+    windowDrag_ = true;
+    windowTicks_ = 0;
+    liveFrames_ = 0;
+    liveTotalMs_ = 0;
+    lastLiveTick_ = 0;
+    GetWindowRect(hwnd_, &dragWindowStart_);
+    autoDragStart_ = GetTickCount64();
+    SetCapture(hwnd_);
+    dragTimer_ = SetTimer(hwnd_, TIMER_DRAG, 8, nullptr);
 }
 
 void LauncherApp::StopWindowDrag()
@@ -1183,14 +1359,28 @@ void LauncherApp::StopWindowDrag()
     windowDrag_ = false;
     if (dragTimer_) { KillTimer(hwnd_, TIMER_DRAG); dragTimer_ = 0; }
     ReleaseCapture();
-    Log("window drag end rect=(%ld,%ld) liveFrames=%d avg=%.1fms (capture=%.1f upload=%.1f blt=%d blur=%d)",
-        dragWindowStart_.left, dragWindowStart_.top, liveFrames_,
+    Log("window drag end rect=(%ld,%ld) windowTicks=%d liveFrames=%d avgGrab=%.1fms (capture=%.1f upload=%.1f blt=%d blur=%d)",
+        dragWindowStart_.left, dragWindowStart_.top, windowTicks_, liveFrames_,
         liveFrames_ > 0 ? liveTotalMs_ / liveFrames_ : 0.0,
         liveFrames_ > 0 ? liveCaptureMs_ / liveFrames_ : 0.0,
         liveFrames_ > 0 ? liveUploadMs_ / liveFrames_ : 0.0,
         backdrop_.LastBltMs(), backdrop_.LastBlurMs());
     RebuildBackdrop();
     ScheduleRepaint();
+
+    if (autoDrag_)
+    {
+        autoDrag_ = false;
+        autoRepeat_--;
+        if (autoRepeat_ > 0)
+        {
+            ScheduleAutoDrag(autoGapMs_);
+        }
+        else
+        {
+            Log("autodrag all done");
+        }
+    }
 }
 
 void LauncherApp::LaunchEntry(int index, bool asAdmin)
@@ -1274,6 +1464,7 @@ void LauncherApp::ShowLauncher()
 
 void LauncherApp::HideLauncher()
 {
+    if (windowResize_) StopWindowResize();
     if (windowDrag_) StopWindowDrag();
     ShowWindow(hwnd_, SW_HIDE);
     Log("hide");
@@ -1418,9 +1609,31 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             POINT p = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
             POINT c = p;
             ScreenToClient(hwnd, &c);
+
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
             float dx = (float)c.x / dpi_;
             float dy = (float)c.y / dpi_;
-            float widthDip = ClientWidthDip(hwnd, dpi_);
+            float widthDip = (float)rc.right / dpi_;
+
+            // 非最大化时四边/四角 6 DIP 内进入缩放（自己实现，不进 WM_ENTERSIZEMOVE）
+            if (!IsZoomed(hwnd))
+            {
+                int border = (int)(6.0f * dpi_);
+                bool left = c.x < border;
+                bool right = c.x >= rc.right - border;
+                bool top = c.y < border;
+                bool bottom = c.y >= rc.bottom - border;
+
+                if (top && left) return HTTOPLEFT;
+                if (top && right) return HTTOPRIGHT;
+                if (bottom && left) return HTBOTTOMLEFT;
+                if (bottom && right) return HTBOTTOMRIGHT;
+                if (left) return HTLEFT;
+                if (right) return HTRIGHT;
+                if (top) return HTTOP;
+                if (bottom) return HTBOTTOM;
+            }
 
             // 右上角齿轮是客户区按钮：先于"标题栏拖动"判定，否则永远点不到
             if (dy >= 0.0f && dy < TitleDip && dx >= widthDip - 48.0f && dx <= widthDip - 18.0f)
@@ -1428,7 +1641,6 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
                 return HTCLIENT;
             }
 
-            // 只有标题区可以拖；其余全部交给客户区自己处理（M2 仍不做边缘缩放）
             if (c.y >= 0 && dy < TitleDip)
             {
                 return HTCAPTION;
@@ -1439,10 +1651,47 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
         case WM_NCLBUTTONDOWN:
             if (w == HTCAPTION)
             {
+                if (IsZoomed(hwnd))
+                {
+                    ToggleMaximize();
+                    return 0;
+                }
                 StartWindowDrag();
                 return 0;
             }
+            if (w >= HTLEFT && w <= HTBOTTOMRIGHT)
+            {
+                static const int edges[8] = {1, 2, 4, 5, 6, 8, 9, 10}; // HTLEFT..HTBOTTOMRIGHT
+                StartWindowResize(edges[w - HTLEFT]);
+                return 0;
+            }
+            Log("nclbuttondown unhandled w=%d", (int)w);
             break;
+
+        case WM_NCLBUTTONDBLCLK:
+            if (w == HTCAPTION)
+            {
+                StopWindowDrag();
+                ToggleMaximize();
+                return 0;
+            }
+            break;
+
+        case WM_ACTIVATE:
+            if (LOWORD(w) == WA_INACTIVE)
+            {
+                if (windowResize_) StopWindowResize();
+                if (windowDrag_) StopWindowDrag();
+            }
+            break;
+
+        case WM_GETMINMAXINFO:
+        {
+            auto* info = reinterpret_cast<MINMAXINFO*>(l);
+            info->ptMinTrackSize.x = (LONG)(680.0f * dpi_);
+            info->ptMinTrackSize.y = (LONG)(460.0f * dpi_);
+            return 0;
+        }
 
         case WM_PAINT:
         {
@@ -1583,6 +1832,25 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
                 LogPerfTick();
                 return 0;
             }
+            if (w == 3) // TIMER_AUTODRAG
+            {
+                KillTimer(hwnd, 3);
+                StartAutoDrag();
+                return 0;
+            }
+            if (w == 5) // TIMER_RESIZE
+            {
+                TickWindowResize();
+                return 0;
+            }
+            if (w == 4) // TIMER_AUTO_EXIT（测试用）
+            {
+                KillTimer(hwnd, 4);
+                Log("auto exit");
+                exiting_ = true;
+                DestroyWindow(hwnd);
+                return 0;
+            }
             if (w == 100)
             {
                 KillTimer(hwnd, 100);
@@ -1591,6 +1859,10 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
                 return 0;
             }
             break;
+
+        case WM_APP_LIVE_CAPTURE:
+            OnLiveCaptureReady();
+            return 0;
 
         case WM_HOTKEY:
             if (w == HOTKEY_ID)

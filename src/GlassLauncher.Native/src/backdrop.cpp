@@ -115,6 +115,9 @@ bool Backdrop::CapturePixels(HWND hwnd, float dpi, double blurRadiusDip)
 
         width_ = halfW;
         height_ = halfH;
+        originX_ = wr.left;
+        originY_ = wr.top;
+        hasOrigin_ = true;
         lastBltMs_ = (int)(t1 - t0);
         lastBlurMs_ = (int)(GetTickCount64() - t1);
     }
@@ -144,6 +147,38 @@ bool Backdrop::Upload(Renderer& renderer)
     }
 
     bitmap_ = renderer.CreateBitmapFromBgra(pixels_.data(), (UINT)width_, (UINT)height_, (UINT)width_ * 4);
+    if (bitmap_)
+    {
+        // 像素已经进 D2D 纹理，CPU 侧这份 0.96MB 没理由常驻；下次静态抓帧会重新分配
+        pixels_.clear();
+        pixels_.shrink_to_fit();
+    }
+    return bitmap_ != nullptr;
+}
+
+bool Backdrop::AdoptPixels(const uint32_t* pixels, int width, int height, int originX, int originY, Renderer& renderer)
+{
+    if (!pixels || width <= 0 || height <= 0) return false;
+
+    width_ = width;
+    height_ = height;
+    originX_ = originX;
+    originY_ = originY;
+    hasOrigin_ = true;
+
+    if (bitmap_)
+    {
+        D2D1_SIZE_U size = bitmap_->GetPixelSize();
+        if ((int)size.width == width && (int)size.height == height)
+        {
+            return SUCCEEDED(bitmap_->CopyFromMemory(nullptr, pixels, (UINT32)width * 4));
+        }
+
+        bitmap_->Release();
+        bitmap_ = nullptr;
+    }
+
+    bitmap_ = renderer.CreateBitmapFromBgra(pixels, (UINT)width, (UINT)height, (UINT)width * 4);
     return bitmap_ != nullptr;
 }
 
