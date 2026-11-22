@@ -82,6 +82,11 @@ private:
     int autoGapMs_ = 700;
     bool autoDragPending_ = false;
 
+    // mac Launchpad 式自动收起：失焦就淡出隐藏。模态对话框/右键菜单/拖拽期间不触发。
+    bool modalOpen_ = false;
+    bool menuOpen_ = false;
+    ULONGLONG lastShowTick_ = 0;
+
     // 打开/关闭动画：分层窗口 alpha 淡入淡出（180ms）
     bool layered_ = false;
     bool fading_ = false;

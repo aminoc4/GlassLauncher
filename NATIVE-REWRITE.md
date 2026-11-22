@@ -240,3 +240,17 @@ DWM 就露出桌面。另有第二处：启动时 `UpdateWindowRegion()` 在客�
   （候选：分层/激活/DWM 表面，下一步试"动画结束后移除 WS_EX_LAYERED"与
   `SwitchToThisWindow`/`SetActiveWindow` 组合）。
 
+### 9.9 失焦自动收起 + 悬停放大裁剪修复
+
+- **失焦自动收起（mac Launchpad 行为）**：窗口不是前台时会出现一条系统白边（非顶层状态的
+  DWM 边框，和顶层时用 `DWMWA_BORDER_COLOR=NONE` 关掉的那条不是同一套），既然不好稳定地
+  按状态去关，就按用户要求改成 **失去前台自动淡出收起**：
+  `WM_ACTIVATE` 收到 `WA_INACTIVE` → `HideLauncher()`。
+  防误触发：模态对话框/右键菜单/条目拖拽/淡出中都不触发，刚唤出的 400ms 内也不触发；
+  `GL_NATIVE_NO_AUTOHIDE=1` 可关。实测 `WA_INACTIVE` → 隐藏、热键 → 重新显示均正常。
+  副作用是"点一下别的窗口启动台就消失"，与 mac 一致。
+- **悬停放大顶部被切**：图标网格的 `PushAxisAlignedClip` 顶边正好是 `GridTopDip`，
+  而悬停放大是绕图块中心缩放，顶边会向上多出 ~3.4 DIP（第一行图块的静止顶边又正好
+  等于 `GridTopDip`），所以动画第一帧会被切在静止顶边上。把裁剪框顶边下移到
+  `GridTopDip - 6` 留出余量；实测放大后的图块可以在静止顶边上方 5px 正常绘制。
+

@@ -365,7 +365,9 @@ void LauncherApp::ShowItemMenu(int index)
     POINT pt = {};
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd_);
+    menuOpen_ = true;
     int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr);
+    menuOpen_ = false;
     DestroyMenu(menu);
     PostMessage(hwnd_, WM_NULL, 0, 0);
 
@@ -384,7 +386,10 @@ void LauncherApp::ShowItemMenu(int index)
         case 5: // 重命名
         {
             std::wstring name = e.displayName;
-            if (PromptDialog::ShowModal(hwnd_, instance_, L"重命名", L"显示名称", name, name) && !name.empty())
+            modalOpen_ = true;
+            bool ok = PromptDialog::ShowModal(hwnd_, instance_, L"重命名", L"显示名称", name, name);
+            modalOpen_ = false;
+            if (ok && !name.empty())
             {
                 entries_[index].displayName = name;
                 SaveEntriesLogged();
@@ -397,8 +402,11 @@ void LauncherApp::ShowItemMenu(int index)
         case 6: // 重新指定目标
         {
             std::wstring path = e.targetPath;
-            if (PromptDialog::ShowModal(hwnd_, instance_, L"重新指定目标",
-                    L"目标路径（.exe / .lnk / .url / 文件夹）", path, path) && !path.empty())
+            modalOpen_ = true;
+            bool ok = PromptDialog::ShowModal(hwnd_, instance_, L"重新指定目标",
+                    L"目标路径（.exe / .lnk / .url / 文件夹）", path, path);
+            modalOpen_ = false;
+            if (ok && !path.empty())
             {
                 entries_[index].targetPath = path;
                 if (icons_[index]) { icons_[index]->Release(); icons_[index] = nullptr; }
@@ -1043,7 +1051,9 @@ void LauncherApp::DrawItems()
     ID2D1HwndRenderTarget* rt = renderer_.Target();
     if (!rt) return;
 
-    rt->PushAxisAlignedClip(D2D1::RectF(PanelMargin + 1.0f, GridTopDip,
+    // 悬停放大是绕图块中心缩放的，顶部会向上多出 ~3.4 DIP；裁剪框必须留这段余量，
+    // 否则放大动画的第一帧就会被切在"静止状态的顶边"上（用户看到的顶部缺一条）。
+    rt->PushAxisAlignedClip(D2D1::RectF(PanelMargin + 1.0f, GridTopDip - 6.0f,
         widthDip_ - PanelMargin - 1.0f, heightDip_ - 8.0f), D2D1_ANTIALIAS_MODE_ALIASED);
 
     for (size_t slot = 0; slot < visible_.size(); slot++)
@@ -1686,6 +1696,8 @@ void LauncherApp::TickFade()
 
 void LauncherApp::ShowLauncher()
 {
+    lastShowTick_ = GetTickCount64();
+
     // 关闭动画进行中又被唤出：直接反向淡入，不再重走"抓背景 + 重排"
     if (fading_ && fadeOut_)
     {
@@ -1747,6 +1759,7 @@ void LauncherApp::ShowSettings()
 {
     if (windowDrag_) StopWindowDrag();
 
+    modalOpen_ = true;
     SettingsDialog::ShowModal(hwnd_, instance_, settings_, [this](const Settings& updated) {
         settings_ = updated;
         ApplyTheme();
@@ -1764,6 +1777,7 @@ void LauncherApp::ShowSettings()
         RebuildBackdrop();
         ScheduleRepaint();
     });
+    modalOpen_ = false;
 
     Log("settings closed theme=%d blur=%.0f topmost=%d", (int)settings_.theme,
         settings_.blurRadius, settings_.topmost ? 1 : 0);
@@ -1803,7 +1817,9 @@ void LauncherApp::ShowTrayMenu()
     POINT pt = {};
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd_);
+    menuOpen_ = true;
     int cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd_, nullptr);
+    menuOpen_ = false;
     DestroyMenu(menu);
     PostMessage(hwnd_, WM_NULL, 0, 0);
 
@@ -1953,6 +1969,18 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             {
                 if (windowResize_) StopWindowResize();
                 if (windowDrag_) StopWindowDrag();
+
+                // mac Launchpad 行为：失去前台就自动收起（也顺带避开"非顶层时系统的白边"）。
+                // 模态对话框/右键菜单/拖拽/淡出中不触发；刚唤出的 400ms 内也不触发，
+                // 避免启动瞬间或 SetForegroundWindow 被系统拒绝时误隐藏。
+                bool busy = modalOpen_ || menuOpen_ || itemDrag_ || fading_ ||
+                            (GetTickCount64() - lastShowTick_ < 400);
+                if (!busy && IsWindowVisible(hwnd_) &&
+                    GetEnvironmentVariableW(L"GL_NATIVE_NO_AUTOHIDE", nullptr, 0) == 0)
+                {
+                    Log("auto-hide on blur");
+                    HideLauncher();
+                }
             }
             break;
 
