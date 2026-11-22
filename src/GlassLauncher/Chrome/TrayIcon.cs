@@ -48,12 +48,15 @@ public sealed class TrayIcon : IDisposable
     private readonly HwndSource _source;
     private readonly uint _taskbarCreatedMessage;
     private readonly Icon _icon;
+    private readonly string _tooltip;
     private bool _added;
     private bool _disposed;
+    private int _addRetries;
 
     public TrayIcon(Icon icon, string tooltip)
     {
         _icon = icon;
+        _tooltip = tooltip;
         _taskbarCreatedMessage = RegisterWindowMessage("TaskbarCreated");
 
         var parameters = new HwndSourceParameters("GlassLauncher.Tray")
@@ -85,15 +88,54 @@ public sealed class TrayIcon : IDisposable
             SzTip = tooltip,
         };
 
-        if (!_added)
+        // 返回值必须看：Explorer 尚未就绪时 NimAdd 会失败，旧实现无条件把 _added 置 true，
+        // 之后永远只发 NimModify，托盘图标就再也加不回来了
+        bool ok = Shell_NotifyIcon(_added ? NimModify : NimAdd, ref data);
+
+        if (ok)
         {
-            Shell_NotifyIcon(NimAdd, ref data);
             _added = true;
         }
         else
         {
-            Shell_NotifyIcon(NimModify, ref data);
+            Diag.Log($"Shell_NotifyIcon({(_added ? "modify" : "add")}) 失败 "
+                + $"error={System.Runtime.InteropServices.Marshal.GetLastWin32Error()} "
+                + $"cbSize={data.CbSize}");
+
+            // 开机自启时 Explorer 可能还没准备好接收托盘图标：隔一秒重试几次，
+            // 否则用户会以为"这个程序没有托盘图标"，之后再也不会出现
+            if (!_added)
+            {
+                ScheduleAddRetry(tooltip);
+            }
         }
+    }
+
+    private void ScheduleAddRetry(string tooltip)
+    {
+        if (_disposed || _addRetries >= 3)
+        {
+            return;
+        }
+
+        _addRetries++;
+
+        var timer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(1),
+        };
+
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+
+            if (!_disposed && !_added)
+            {
+                AddOrUpdate(tooltip);
+            }
+        };
+
+        timer.Start();
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -118,9 +160,9 @@ public sealed class TrayIcon : IDisposable
         }
         else if (msg == (int)_taskbarCreatedMessage && _taskbarCreatedMessage != 0)
         {
-            // 资源管理器重启后托盘会被清空，重新添加
+            // 资源管理器重启后托盘会被清空，重新添加（tooltip 用回原始文案，别写死英文）
             _added = false;
-            AddOrUpdate("Glass Launcher");
+            AddOrUpdate(_tooltip);
             handled = true;
         }
 

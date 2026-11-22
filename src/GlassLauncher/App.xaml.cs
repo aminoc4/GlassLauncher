@@ -42,10 +42,17 @@ public partial class App : Application
         ThemeService.Apply(dark);
 
         // 全局异常留痕：async void（如 FreezeBackdrop）里抛出的异常会到这里，
-        // 不记的话"窗口凭空消失/行为诡异"根本没法从日志定性
+        // 不记的话"窗口凭空消失/行为诡异"根本没法从日志定性。
+        //
+        // ⚠ 必须设 e.Handled = true：不设的话 WPF 会把异常重新抛到调度线程，
+        // 线程终止 → 消息泵停摆 → 窗口变成"点不动的幽灵窗口"（任务管理器显示"未响应"），
+        // 然后整个进程才消失。用户感受到的是"卡死后崩溃"，而日志里只有一行异常。
+        // 曾经 FreezeBackdrop 的可选参数触发的 TargetParameterCountException 就是这样把
+        // 整个程序带走的（见 REVIEW-FINDINGS P0-1/P0-2）。
         DispatcherUnhandledException += (_, e) =>
         {
             Chrome.Diag.Log($"DispatcherUnhandledException: {e.Exception}");
+            e.Handled = true;
         };
 
         base.OnStartup(e);

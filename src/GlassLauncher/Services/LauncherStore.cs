@@ -42,40 +42,105 @@ public static class LauncherStore
     {
         error = null;
 
+        if (!File.Exists(DataFilePath))
+        {
+            return new List<AppEntry>();
+        }
+
         try
         {
-            if (!File.Exists(DataFilePath))
-            {
-                return new List<AppEntry>();
-            }
-
             string json = File.ReadAllText(DataFilePath, Encoding.UTF8);
-            if (string.IsNullOrWhiteSpace(json))
-            {
-                return new List<AppEntry>();
-            }
-
-            List<AppEntry>? list = JsonSerializer.Deserialize<List<AppEntry>>(json, ReadOptions);
-            if (list is null)
-            {
-                return new List<AppEntry>();
-            }
-
-            // 空 Id 的条目无法定位图标缓存，补一个
-            foreach (AppEntry entry in list)
-            {
-                if (entry.Id == Guid.Empty)
-                {
-                    entry.Id = Guid.NewGuid();
-                }
-            }
-
-            return list.OrderBy(e => e.SortOrder).ToList();
+            return ParseOrEmpty(json);
         }
-        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException or NotSupportedException)
+        catch (JsonException ex)
+        {
+            // 主文件坏了：绝不能直接返回空列表 —— 之后任何一次 Persist() 都会用空列表
+            // 把用户仅有的数据覆盖掉（旧实现就是这样静默丢数据的）。
+            // 流程：先留一份现场，再尝试 .bak；备份可用就扶正它。
+            string? preserved = TryPreserveCorrupt();
+            List<AppEntry>? recovered = TryRecoverFromBackup();
+
+            if (recovered is { Count: > 0 })
+            {
+                error = $"数据文件损坏，已从备份恢复 {recovered.Count} 项"
+                    + (preserved is null ? string.Empty : $"（损坏文件已留存：{preserved}）");
+                return recovered;
+            }
+
+            error = $"数据文件损坏且备份不可用：{ex.Message}"
+                + (preserved is null ? string.Empty : $"（损坏文件已留存：{preserved}）");
+            return new List<AppEntry>();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
             error = ex.Message;
             return new List<AppEntry>();
+        }
+    }
+
+    private static List<AppEntry> ParseOrEmpty(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return new List<AppEntry>();
+        }
+
+        List<AppEntry>? list = JsonSerializer.Deserialize<List<AppEntry>>(json, ReadOptions);
+        if (list is null)
+        {
+            return new List<AppEntry>();
+        }
+
+        // 空 Id 的条目无法定位图标缓存，补一个
+        foreach (AppEntry entry in list)
+        {
+            if (entry.Id == Guid.Empty)
+            {
+                entry.Id = Guid.NewGuid();
+            }
+        }
+
+        return list.OrderBy(e => e.SortOrder).ToList();
+    }
+
+    /// <summary>把损坏的主文件复制一份留证（不删原文件，用户还有手工抢救的机会）。</summary>
+    private static string? TryPreserveCorrupt()
+    {
+        try
+        {
+            string path = DataFilePath + $".corrupt-{DateTime.Now:yyyyMMdd-HHmmss}.json";
+            File.Copy(DataFilePath, path, overwrite: true);
+            return path;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>用上一次原子替换留下的 .bak 恢复；成功时顺手把主文件扶正。</summary>
+    private static List<AppEntry>? TryRecoverFromBackup()
+    {
+        try
+        {
+            string backupPath = DataFilePath + ".bak";
+            if (!File.Exists(backupPath))
+            {
+                return null;
+            }
+
+            List<AppEntry> recovered = ParseOrEmpty(File.ReadAllText(backupPath, Encoding.UTF8));
+            if (recovered.Count == 0)
+            {
+                return null;
+            }
+
+            File.Copy(backupPath, DataFilePath, overwrite: true);
+            return recovered;
+        }
+        catch
+        {
+            return null;
         }
     }
 

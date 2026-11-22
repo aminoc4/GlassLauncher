@@ -48,6 +48,21 @@ public static class HotkeyHelper
                     modifiers |= ModWin;
                     break;
                 default:
+                    // 数字键：Format() 把 Key.D1 写成 "1"，而 Enum.TryParse("1") 会当成
+                    // 【枚举数值】1 = Key.Cancel（"9" → Key.KanaMode，"0" → None 直接失效）。
+                    // 所以数字必须先显式映射回 Key.D0..D9，否则 Ctrl+1 重启后变成 Ctrl+Cancel。
+                    if (part.Length == 1 && part[0] is >= '0' and <= '9')
+                    {
+                        key = (Key)((int)Key.D0 + (part[0] - '0'));
+                        break;
+                    }
+
+                    // 其它纯数字串同样不接受（Enum.TryParse 会把它们当枚举值）
+                    if (IsAllDigits(part))
+                    {
+                        return false;
+                    }
+
                     if (!Enum.TryParse(part, ignoreCase: true, out key))
                     {
                         return false;
@@ -63,6 +78,14 @@ public static class HotkeyHelper
             return false;
         }
 
+        // 和 TryFromKeyboard 对齐：没有修饰键的裸键会把那个键从所有程序里抢走，
+        // 只有 F1~F12 允许单按（手改 settings.json 也拦得住）
+        bool functionKey = key is >= Key.F1 and <= Key.F12;
+        if (modifiers == 0 && !functionKey)
+        {
+            return false;
+        }
+
         try
         {
             virtualKey = unchecked((uint)KeyInterop.VirtualKeyFromKey(key));
@@ -73,6 +96,25 @@ public static class HotkeyHelper
         }
 
         return virtualKey != 0;
+    }
+
+    /// <summary>纯数字串（Enum.TryParse 会把它当枚举数值，必须挡掉）。</summary>
+    private static bool IsAllDigits(string value)
+    {
+        if (value.Length == 0)
+        {
+            return false;
+        }
+
+        foreach (char c in value)
+        {
+            if (c is < '0' or > '9')
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

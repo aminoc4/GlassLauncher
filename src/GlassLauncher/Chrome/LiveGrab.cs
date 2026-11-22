@@ -20,10 +20,10 @@ namespace GlassLauncher.Chrome;
 /// （GDI DC 有线程亲和性），全程零托管分配；BitBlt 结果用指针直接灌进
 /// WriteableBitmap，Bgr32 与 Bgra32 显示等价（都按不透明处理）且免 alpha 修补。
 ///
-/// 必须与静态路径（ScreenGrab.Capture）完全同规格：全分辨率 + CAPTUREBLT。
+/// 必须与静态路径（ScreenGrab.Capture）完全同规格：全分辨率 + CAPTUREBLT，且
+/// **抓取矩形必须与请求区域逐像素相等** —— 显示端是 Stretch=Fill 的 1:1 映射，
+/// 任何多余的像素都会被缩放，背景就和桌面/静态帧对不齐（松手换帧时看得见）。
 /// 试过 50% 降采样（COLORONCOLOR 点采样），把背景细文字打碎成灰块，不可接受。
-///
-/// 尺寸按 32px 分桶：交互缩放时尺寸每帧都在变，跨桶才重建 DIB/位图。
 /// </summary>
 internal sealed class LiveGrab : IDisposable
 {
@@ -52,6 +52,9 @@ internal sealed class LiveGrab : IDisposable
     private IntPtr _bits;
     private int _width;
     private int _height;
+
+    // 上传缓冲池：工作线程借、UI 线程归还（WritePixels 之后）
+    private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _spareBuffers = new();
 
     // 仅 UI 线程访问
     private WriteableBitmap? _bitmap;
@@ -146,19 +149,17 @@ internal sealed class LiveGrab : IDisposable
                 continue;
             }
 
-            int bucketW = Bucket(w);
-            int bucketH = Bucket(h);
-
-            if (_memoryDc == IntPtr.Zero || bucketW != _width || bucketH != _height)
+            // 尺寸必须【精确】等于请求区域。
+            // 曾经按 32px 桶向上取整（避免交互缩放时每帧重建 DIB），但桶尺寸比请求大 0~31px，
+            // 而显示端 FrozenSurface 是 Stretch=Fill + Margin=-48 —— 多出来的像素会被压缩回目标尺寸，
+            // 背景整体缩放约 1.2%，与桌面/静态帧在右下角错位可达 14px，松手换帧时就会跳一下。
+            // 现在 live 只在"移动窗口"时用（尺寸不变，不会反复重建），缩放走模态路径不经过这里。
+            if (_memoryDc == IntPtr.Zero || w != _width || h != _height)
             {
-                if (!RecreateDib(bucketW, bucketH))
+                if (!RecreateDib(w, h))
                 {
                     continue;
                 }
-
-                // WriteableBitmap 是 WPF 对象，必须在 UI 线程创建。
-                // 先排创建、再排上屏，Dispatcher 的 FIFO 顺序保证不会用错尺寸
-                _dispatcher.BeginInvoke(() => CreateBitmap(bucketW, bucketH));
             }
 
             _grabClock.Restart();
@@ -173,34 +174,61 @@ internal sealed class LiveGrab : IDisposable
             GdiFlush();
             LastGrabMs = _grabClock.Elapsed.TotalMilliseconds;
 
-            // 上屏转交 UI 线程（WritePixels 是 WPF 调用）。闭包只捕获值类型，零大对象分配
+            // 把 DIB 的像素拷进托管缓冲，再交 UI 线程 WritePixels 上屏。
+            //
+            // ⚠ 这段曾经整段丢失（ab4e894 重构时漏掉的），表现是 BitBlt 抓得很好、
+            // 但 WriteableBitmap 从来没被写入过 —— 拖动时背景整片变成空位图（黑底 + 白纱 = 一片灰）。
+            // 缓冲从池里借，UI 上完屏归还，避免每帧分配几 MB 托管数组（会全压在 LOH 上）。
+            int bytes = _width * _height * 4;
+            byte[] buffer = RentBuffer(bytes);
+            Marshal.Copy(_bits, buffer, 0, bytes);
+
             var capturedOrigin = origin;
             var capturedDpi = new DpiScale(dpiX, dpiY);
-            _dispatcher.BeginInvoke(() => RaiseFrame(capturedOrigin, capturedDpi));
+            int capturedWidth = _width;
+            int capturedHeight = _height;
+            _dispatcher.BeginInvoke(() => UploadAndRaise(buffer, capturedWidth, capturedHeight, capturedOrigin, capturedDpi));
         }
 
         ReleaseGdi();
     }
 
-    private static int Bucket(int v) => (v + 31) / 32 * 32;
-
-    private void CreateBitmap(int width, int height)
+    /// <summary>借一块上传缓冲：优先复用 UI 线程归还的，尺寸不匹配就新分配。</summary>
+    private byte[] RentBuffer(int bytes)
     {
-        _bitmap = new WriteableBitmap(width, height, 96, 96, PixelFormats.Bgr32, null);
+        if (_spareBuffers.TryDequeue(out byte[]? pooled) && pooled.Length == bytes)
+        {
+            return pooled;
+        }
+
+        return new byte[bytes];
     }
 
-    private void RaiseFrame(Point originPx, DpiScale dpi)
+    /// <summary>UI 线程：把像素写进 WriteableBitmap、归还缓冲，然后通知订阅者。</summary>
+    private void UploadAndRaise(byte[] pixels, int width, int height, Point originPx, DpiScale dpi)
     {
-        var bitmap = _bitmap;
-        if (bitmap is null)
+        WriteableBitmap? bitmap = _bitmap;
+
+        if (bitmap is null || bitmap.PixelWidth != width || bitmap.PixelHeight != height)
         {
-            return;
+            // WriteableBitmap 是 WPF 对象，只能在 UI 线程创建
+            bitmap = new WriteableBitmap(width, height, dpi.DpiScaleX * 96, dpi.DpiScaleY * 96,
+                PixelFormats.Bgr32, null);
+            _bitmap = bitmap;
+        }
+
+        bitmap.WritePixels(new Int32Rect(0, 0, width, height), pixels, width * 4, 0);
+
+        // 归还缓冲（容量不匹配的旧缓冲直接丢弃，让 GC 收）
+        if (pixels.Length == width * height * 4)
+        {
+            _spareBuffers.Enqueue(pixels);
         }
 
         FrameReady?.Invoke(bitmap, originPx, dpi);
     }
 
-    /// <summary>工作线程重建 GDI 资源（DIB section 按 32px 桶尺寸）。失败返回 false。</summary>
+    /// <summary>工作线程重建 GDI 资源（尺寸精确等于请求区域）。失败返回 false。</summary>
     private bool RecreateDib(int width, int height)
     {
         ReleaseGdi();
@@ -253,7 +281,8 @@ internal sealed class LiveGrab : IDisposable
     /// <summary>释放 GDI 资源。必须在创建它们的线程（工作线程）上调用。</summary>
     private void ReleaseGdi()
     {
-        _bitmap = null;
+        // 注意：不要在这里动 _bitmap。它是 UI 线程独有的字段（CreateBitmap 在 UI 线程写），
+        // 从工作线程置 null 属于跨线程写同一字段，虽然不会立刻出事，但会把"谁拥有它"搞乱。
 
         if (_memoryDc != IntPtr.Zero && _previous != IntPtr.Zero && _previous != new IntPtr(-1))
         {

@@ -41,8 +41,7 @@ internal static class BackdropService
         //   浅色基底：白内容原生 ~250（亮玻璃的关键），蓝壁纸 → (117,137,184)，
         //             配 45% 白纱 → (177,189,213) 粉蓝，亮度色相都压着 mac 的观感。
         // 所以跟随主题：浅色主题浅色基底，暗色主题暗色基底。
-        bool darkBase = darkMode;
-        int darkModeHr = ApplyDarkMode(hwnd, darkBase);
+        int darkModeHr = ApplyDarkMode(hwnd, darkMode);
 
         bool result;
         if (IsWindows11)
@@ -77,7 +76,7 @@ internal static class BackdropService
             result = ApplyAcrylic10(hwnd, tint);
         }
 
-        Diag.Log($"Apply kind={kind} build={Environment.OSVersion.Version.Build} themeDark={darkMode} baseDark={darkBase} hr=0x{darkModeHr:X8} applied={result}");
+        Diag.Log($"Apply kind={kind} build={Environment.OSVersion.Version.Build} themeDark={darkMode} hr=0x{darkModeHr:X8} applied={result}");
         return result;
     }
 

@@ -286,6 +286,7 @@ public partial class MainWindow : GlassWindow
     {
         const int WM_ENTERSIZEMOVE = 0x0231;
         const int WM_NCLBUTTONDOWN = 0x00A1;
+        const int WM_NCLBUTTONDBLCLK = 0x00A3;
         const int HTCAPTION = 2;
         const int WM_EXITSIZEMOVE = 0x0232;
         const int WM_HOTKEY = 0x0312;
@@ -319,6 +320,17 @@ public partial class MainWindow : GlassWindow
 
                 break;
 
+            case WM_NCLBUTTONDBLCLK:
+                // 双击标题栏（最大化/还原）走的是默认处理，但按住时可能已经进了手动拖动。
+                // 这里先把手动拖动收掉，再把消息交回系统，否则 _manualDrag 会带着最大化状态
+                // 继续用 SetWindowPos 搬窗口。
+                if ((int)wParam == HTCAPTION)
+                {
+                    AbortWindowDrag("titlebar double-click");
+                }
+
+                break;
+
             case WM_HOTKEY:
                 if (wParam.ToInt32() == HotkeyId)
                 {
@@ -347,7 +359,9 @@ public partial class MainWindow : GlassWindow
     /// </summary>
     private void StartManualDrag()
     {
-        if (_manualDrag || WindowState != WindowState.Normal)
+        // 不可见时别启动：否则 Hide 到托盘后，15ms 的轮询还在给隐藏窗口 SetWindowPos，
+        // 窗口会在看不见的地方跟着鼠标跑，_inModalMove 也会卡在 true 让后续抓帧全部让路
+        if (_manualDrag || !IsVisible || WindowState != WindowState.Normal)
         {
             return;
         }
@@ -366,6 +380,7 @@ public partial class MainWindow : GlassWindow
         _manualDragWindowStart = new Point(rect.Left, rect.Top);
         _manualDrag = true;
         _inModalMove = true; // 与模态拖动一致：让 RefreezeSoon/FreezeBackdrop 让路
+        Diag.Log($"manual drag start rect=({rect.Left},{rect.Top})");
         _ = ReleaseWin32Capture();
 
         // 手动拖动没有 WM_ENTERSIZEMOVE，live 由这里直接驱动
@@ -410,7 +425,7 @@ public partial class MainWindow : GlassWindow
         _inModalMove = false;
 
         // 停 live。松手的视觉连续性靠"精确对齐 + 原子换帧"，绝不能加动画：
-        //  - 最后一帧 live 帧带着预测偏移（拖动中每帧的位移量，可达十几像素），
+        //  - 最后一帧 live 帧带着对齐偏移（内容抓于 O_c，窗口此刻在 W，偏移 s=(O_c−W)/dpi），
         //    任何"回落到 0"的动画都会把已对齐的背景推歪 —— 那本身就是闪烁；
         //  - 静态帧几毫秒后就到，中途动画必然被硬杀，等于自己制造一次跳变。
         if (_liveGrabActive)
@@ -419,10 +434,10 @@ public partial class MainWindow : GlassWindow
             _liveGrabActive = false;
 
             // 精确对齐：窗口已停，用真实终点重算最后一帧的偏移
-            // （拖动中偏移是"预测值" s ≈ (O_n - O_{n-1})，正确值是 (O_c - W)）。
+            // （拖动中偏移是按"抓取瞬间 vs 当前"算的，末帧上屏后窗口可能还挪了最后一点）。
             // 修正后最后一帧与桌面像素级重合；随后静态帧（偏移恒 0）原子替换，
             // 两个状态完全一样 —— 松手零闪烁。锚定推导：内容抓于 O_c、以偏移 s
-            // 显示在窗口 W 上时，屏幕对齐条件为 s = (O_c - W) / dpi。
+            // 显示在窗口 W 上时，屏幕对齐条件为 s = (O_c − W) / dpi。
             IntPtr hwndEnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
             if (_livePrevOrigin is Point lastOrigin && hwndEnd != IntPtr.Zero
                 && ScreenGrab.GetWindowRect(hwndEnd, out ScreenGrab.Rect endRect))
@@ -443,6 +458,42 @@ public partial class MainWindow : GlassWindow
 
         // 立即重新锚定桌面（排除常开，抓帧零切换零等待；instant=直接换帧不走淡入）
         FreezeBackdrop(instant: true);
+    }
+
+    /// <summary>
+    /// 把"正在拖窗口"的状态硬性收掉，不做重新锚定（调用方要么马上隐藏、要么马上退出）。
+    ///
+    /// 为什么需要它：手动拖动是 15ms 轮询 + SetWindowPos，没有鼠标捕获，所以
+    /// "隐藏到托盘 / 关窗 / 双击标题栏最大化"这些路径都不会自然产生鼠标抬起，
+    /// 轮询会继续给一个隐藏的窗口改位置，`_inModalMove` 也会卡在 true，
+    /// 让之后的 RefreezeSoon/FreezeBackdrop 永远让路（背景停在旧位置）。
+    /// </summary>
+    private void AbortWindowDrag(string reason)
+    {
+        if (!_manualDrag)
+        {
+            return;
+        }
+
+        Diag.Log($"window drag aborted reason={reason}");
+        _manualDrag = false;
+        _manualDragTimer?.Stop();
+        _inModalMove = false;
+
+        if (_liveGrabActive)
+        {
+            CompositionTarget.Rendering -= OnLiveFrame;
+            _liveGrabActive = false;
+        }
+
+        // 排队中的补抓也作废：它们带着旧的几何/instant 语义，会让唤出后的第一帧错位
+        _freezeQueued = false;
+        _freezeQueuedInstant = false;
+
+        FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+        FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+        FrozenShift.X = 0;
+        FrozenShift.Y = 0;
     }
 
     /// <summary>
@@ -473,17 +524,10 @@ public partial class MainWindow : GlassWindow
         }
 
         // 排除永久常开：已开就零切换零预热直接抓；只有异常掉开过才需要重开+预热
-        bool exclusionFresh = false;
+        bool exclusionFresh = EnsureExclusion();
         if (!_exclusionHeld)
         {
-            if (!ScreenGrab.TrySetExclusion(hwnd, true))
-            {
-                return;
-            }
-
-            _exclusionHeld = true;
-            _exclusionOnTick = Environment.TickCount64;
-            exclusionFresh = true;
+            return;
         }
 
         _liveGrab ??= new LiveGrab();
@@ -520,14 +564,13 @@ public partial class MainWindow : GlassWindow
         // 作废在途抓帧
         _captureGeneration++;
 
-        if (_exclusionHeld)
+        // 关排除：以实查为准（缓存可能和真实状态漂移）
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd != IntPtr.Zero && ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE)
         {
-            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-            if (hwnd != IntPtr.Zero)
-            {
-                ScreenGrab.TrySetExclusion(hwnd, false);
-                _exclusionHeld = false;
-            }
+            ScreenGrab.TrySetExclusion(hwnd, false);
+            _exclusionHeld = ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE;
+            Diag.Log($"modal drag: exclusion released held={_exclusionHeld}");
         }
 
         // 不开 live：模态循环里排除必须关，而抓屏依赖排除 —— 冻结帧顶上
@@ -541,11 +584,19 @@ public partial class MainWindow : GlassWindow
     private void WndProc_DragEnded()
     {
         IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-        if (!_exclusionHeld && hwnd != IntPtr.Zero)
+        if (hwnd != IntPtr.Zero && ScreenGrab.GetExclusion(hwnd) != ScreenGrab.WDA_EXCLUDEFROMCAPTURE)
         {
-            ScreenGrab.TrySetExclusion(hwnd, true);
-            _exclusionHeld = true;
-            _exclusionOnTick = Environment.TickCount64;
+            if (ScreenGrab.TrySetExclusion(hwnd, true))
+            {
+                _exclusionHeld = true;
+                _exclusionOnTick = Environment.TickCount64;
+                Diag.Log("modal drag ended: exclusion restored");
+            }
+            else
+            {
+                _exclusionHeld = false;
+                Diag.Log("modal drag ended: exclusion restore FAILED");
+            }
         }
 
         // 立即重抓锚定（不走 120ms 防抖）。排除刚恢复的话 FreezeBackdrop
@@ -583,9 +634,12 @@ public partial class MainWindow : GlassWindow
     }
 
     /// <summary>
-    /// 后台抓帧完成（UI 线程回调）：上屏 + 位移预测。
-    /// 位移预测把本帧内容按上一帧的实际位移前移，抵消上屏前窗口又移动的那一帧，
-    /// 消除"背景慢半拍"的游动感。
+    /// 后台抓帧完成（UI 线程回调）：上屏 + 位移对齐。
+    ///
+    /// 对齐条件与 EndManualDrag 里完全相同：<c>s = (O_capture − W_now) / dpi</c>。
+    /// 本帧内容抓于 <paramref name="originPx"/>，而它上屏时窗口还在移动，所以必须用
+    /// 【当前】窗口原点来算，不能用"上一帧的位移量"——后者符号是反的（窗口往右走，
+    /// 内容要往左补），会把背景推成两帧滞后，松手对齐的那一刻再跳回来。
     /// </summary>
     private void OnLiveFrameReady(WriteableBitmap bitmap, Point originPx, DpiScale dpi)
     {
@@ -599,12 +653,15 @@ public partial class MainWindow : GlassWindow
         FrozenSurfaceAlt.Opacity = 0;
         FrozenBackdropHost.Visibility = Visibility.Visible;
 
-        if (_livePrevOrigin is Point prev)
-        {
-            FrozenShift.X = (originPx.X - prev.X) / dpi.DpiScaleX;
-            FrozenShift.Y = (originPx.Y - prev.Y) / dpi.DpiScaleY;
-        }
+        Point windowNow = PointToScreen(new Point(0, 0));
+        DpiScale dpiNow = VisualTreeHelper.GetDpi(this);
 
+        FrozenShift.BeginAnimation(TranslateTransform.XProperty, null);
+        FrozenShift.BeginAnimation(TranslateTransform.YProperty, null);
+        FrozenShift.X = (originPx.X - windowNow.X) / dpiNow.DpiScaleX;
+        FrozenShift.Y = (originPx.Y - windowNow.Y) / dpiNow.DpiScaleY;
+
+        // 松手时要用"最后上屏那一帧的抓取原点"重算真实终点偏移，这里记的就是它
         _livePrevOrigin = originPx;
 
         double ms = _liveGrab!.LastGrabMs;
@@ -631,9 +688,64 @@ public partial class MainWindow : GlassWindow
         }
 
         bool wasExcluded = ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE;
-        ScreenGrab.TrySetExclusion(hwnd, !wasExcluded);
-        ScreenGrab.TrySetExclusion(hwnd, wasExcluded);
-        Diag.Log("dwm surface rebuilt");
+        bool toggled = ScreenGrab.TrySetExclusion(hwnd, !wasExcluded);
+        bool restored = ScreenGrab.TrySetExclusion(hwnd, wasExcluded);
+
+        // 关键：这里刚把排除"关掉又打开"，DWM 要 1~2 个合成帧才真正落实新的亲和性。
+        // 必须重置计时，否则紧接着排队的 FreezeBackdrop 会读到旧的 _exclusionOnTick、
+        // 以为"早就生效了"，跳过 60ms 等待直接抓 —— 抓进来的背景里带着本窗口自己（鬼影帧）。
+        _exclusionOnTick = Environment.TickCount64;
+        _exclusionHeld = ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE;
+
+        Diag.Log($"dwm surface rebuilt toggle={toggled} restore={restored} held={_exclusionHeld}");
+    }
+
+    /// <summary>
+    /// 保证截屏排除处于开启状态，并把 <c>_exclusionHeld</c> / <c>_exclusionOnTick</c>
+    /// 同步成"实查到的真实状态"。
+    ///
+    /// 之前 StartDragRide 用缓存的 <c>_exclusionHeld</c> 判断、FreezeBackdrop 每次实查
+    /// GetExclusion，两者一旦漂移（RebuildDwmSurface 恢复失败、DWM 重启、远程会话切换），
+    /// 拖动期间就会抓到自己而且完全没有日志。现在两边都走这里。
+    /// </summary>
+    /// <returns>true 表示"本次是刚打开的"（调用方需要跑预热帧）。</returns>
+    private bool EnsureExclusion()
+    {
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero)
+        {
+            _exclusionHeld = false;
+            return false;
+        }
+
+        if (ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE)
+        {
+            if (!_exclusionHeld)
+            {
+                Diag.Log("exclusion 实际开着但缓存是 false，已同步（不重新打开，避免白闪一次）");
+                _exclusionHeld = true;
+            }
+
+            return false;
+        }
+
+        bool wasHeld = _exclusionHeld;
+        if (!ScreenGrab.TrySetExclusion(hwnd, true))
+        {
+            _exclusionHeld = false;
+            Diag.Log("EnsureExclusion 失败：SetWindowDisplayAffinity 拒绝");
+            return false;
+        }
+
+        _exclusionHeld = true;
+        _exclusionOnTick = Environment.TickCount64;
+
+        if (wasHeld)
+        {
+            Diag.Log("exclusion 被系统掉开了，已重新打开（需要预热帧）");
+        }
+
+        return true;
     }
 
     public MainWindow()
@@ -685,6 +797,9 @@ public partial class MainWindow : GlassWindow
         Closed += (_, _) =>
         {
             ClearDragFlags();
+            AbortWindowDrag("closed");
+            _liveGrab?.Dispose();
+            _liveGrab = null;
             _tray?.Dispose();
             Persist();
         };
@@ -743,6 +858,14 @@ public partial class MainWindow : GlassWindow
         // 像素映射全得重来，也补一帧（LocationChanged 通常也会触发，这里兜底）
         DpiChanged += (_, e) =>
         {
+            // 实测日志里会收到大量 "1.25 -> 1.25" 的假事件：它们会触发一次
+            // ApplyCornerMode(force)（= SWP_FRAMECHANGED 全量非客户区重算）+ 一次重抓，
+            // 纯属白干。只有 DPI 真的变了才有几何需要重算。
+            if (e.OldDpi.DpiScaleX == e.NewDpi.DpiScaleX && e.OldDpi.DpiScaleY == e.NewDpi.DpiScaleY)
+            {
+                return;
+            }
+
             Diag.Log($"DpiChanged {e.OldDpi.DpiScaleX:F2} -> {e.NewDpi.DpiScaleX:F2} inModalMove={_inModalMove}");
             RefreezeSoon();
         };
@@ -753,7 +876,16 @@ public partial class MainWindow : GlassWindow
             Diag.Log($"IsVisibleChanged -> {e.NewValue} at {Environment.StackTrace.Split('\n').Skip(3).FirstOrDefault()?.Trim()}");
         };
         // 最大化时 DWM 会去掉圆角裁剪，描边层的 8px 弧会在四角切出小缺口，同步改直角
-        StateChanged += (_, _) => UpdateLayerCorner();
+        StateChanged += (_, _) =>
+        {
+            UpdateLayerCorner();
+
+            // 状态一变（最大化/还原/最小化），手动拖动的前提就变了，收掉
+            if (WindowState != WindowState.Normal)
+            {
+                AbortWindowDrag("state changed");
+            }
+        };
 
         // 入场动效：等这一帧布局完成，容器才拿得到
         Loaded += (_, _) =>
@@ -761,8 +893,12 @@ public partial class MainWindow : GlassWindow
             // 上次退出时的位置可能停在屏幕外，先拉回来再播入场
             EnsureOnScreen();
             Dispatcher.BeginInvoke(PlayEntrance, DispatcherPriority.Loaded);
-            // 第一帧背景：入场淡入会把它接住，不会白屏
-            Dispatcher.BeginInvoke(FreezeBackdrop, DispatcherPriority.Loaded);
+            // 第一帧背景：入场淡入会把它接住，不会白屏。
+            // ⚠ 必须用无参 lambda 包一层：FreezeBackdrop 有可选参数（bool instant = false），
+            // 而 Dispatcher.BeginInvoke(Delegate, …) 内部走 Delegate.DynamicInvoke —— 反射调用
+            // 不认可选参数，直接传方法组会抛 TargetParameterCountException。
+            // 这个坑曾经让程序"启动 0.3 秒后无响应然后消失"（见 REVIEW-FINDINGS P0-1）。
+            Dispatcher.BeginInvoke((Action)(() => FreezeBackdrop()), DispatcherPriority.Loaded);
 
             // 设置里开了“启动时检查失效条目”才跑；检查是后台 IO，晚一拍不碍事
             if (_settings.CheckBrokenOnStart)
@@ -868,8 +1004,10 @@ public partial class MainWindow : GlassWindow
         }
 
         IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-        if (hwnd == IntPtr.Zero || ActualWidth < 40 || ActualHeight < 40)
+        if (hwnd == IntPtr.Zero || !IsVisible || ActualWidth < 40 || ActualHeight < 40)
         {
+            // 隐藏/最小化时抓屏没有意义：抓到的是"窗口不在那儿"的桌面，
+            // 唤出后会显示一张和窗口位置无关的旧帧。ShowFromTray 会自己补抓。
             return;
         }
 
@@ -893,16 +1031,11 @@ public partial class MainWindow : GlassWindow
 
         try
         {
-            bool exclusionReady = ScreenGrab.GetExclusion(hwnd) == ScreenGrab.WDA_EXCLUDEFROMCAPTURE;
-
-            if (!exclusionReady)
+            // 以实查结果为准补开排除（顺带修掉"以为开着其实没开"的日志盲区）
+            EnsureExclusion();
+            if (!_exclusionHeld)
             {
-                if (!ScreenGrab.TrySetExclusion(hwnd, true))
-                {
-                    return;
-                }
-
-                _exclusionOnTick = Environment.TickCount64;
+                return;
             }
 
             // 排除刚（重）开的话，DWM 要过一两只合成帧才真正落实，补足等待。
@@ -912,6 +1045,15 @@ public partial class MainWindow : GlassWindow
             if (sinceOn < ExclusionSettleMs)
             {
                 await Task.Delay((int)(ExclusionSettleMs - sinceOn));
+
+                // await 之后窗口可能已经被隐藏/关闭：这里的 this 已经不能随便用，
+                // 否则 VisualTreeHelper/PointToScreen 会抛异常 —— async void 里抛出去
+                // 只能靠全局处理器兜，那是"卡死后崩溃"的配方。复查一遍再继续。
+                if (new System.Windows.Interop.WindowInteropHelper(this).Handle == IntPtr.Zero || !IsVisible)
+                {
+                    Diag.Log("freeze aborted (window hidden/closed while waiting for exclusion)");
+                    return;
+                }
             }
 
             int generation = _captureGeneration;
@@ -951,6 +1093,13 @@ public partial class MainWindow : GlassWindow
             FrozenShift.Y = 0;
 
             ShowFrozenFrame(bitmap, instant);
+            Diag.Log($"freeze ok {width}x{height} instant={instant} settle={sinceOn}ms px={pixels.Length / 4}");
+        }
+        catch (Exception ex)
+        {
+            // async void：任何漏网的异常都不能交给全局处理器（那里只能记一笔，
+            // 用户看到的是"窗口卡死"）。这里就地记下并放行。
+            Diag.Log($"FreezeBackdrop 失败：{ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -1022,10 +1171,13 @@ public partial class MainWindow : GlassWindow
 
     // 拖动期采样器（行车记录仪）：120ms 一拍记录 rect/透明度/缩放/前台窗口，
     // 每 3 拍抓一张屏幕存图。"窗口凭空消失"复现时靠它定性是 off-screen、
-    // 内容塌了还是被压到别人后面
+    // 内容塌了还是被压到别人后面。
+    // 只在 DEBUG 编入（Release 里这几个字段不参与编译，避免"从未赋值"这类噪音警告）
+#if DEBUG
     private DispatcherTimer? _dragSampler;
     private int _dragSamplerTicks;
     private int _sampleSeq;
+#endif
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECTlp rect);
@@ -1063,9 +1215,7 @@ public partial class MainWindow : GlassWindow
 
     private void StopDragSamplerAfterDelay()
     {
-#if !DEBUG
-        return;
-#endif
+#if DEBUG
         // 立刻停会导致最后一拍看不到松手后的状态；延 2 秒停
         var t = new DispatcherTimer(DispatcherPriority.Send) { Interval = TimeSpan.FromSeconds(2) };
         t.Tick += (_, _) =>
@@ -1075,8 +1225,10 @@ public partial class MainWindow : GlassWindow
             Diag.Log("sampler stopped");
         };
         t.Start();
+#endif
     }
 
+#if DEBUG
     private void SampleDragState()
     {
         _dragSamplerTicks++;
@@ -1105,14 +1257,15 @@ public partial class MainWindow : GlassWindow
                 System.IO.Directory.CreateDirectory(dir);
                 string path = System.IO.Path.Combine(dir, $"drag{_sampleSeq:D3}.png");
 
-                int w = SystemParameters.PrimaryScreenWidth is { } pw ? (int)(pw * 1) : 0;
-                // 用物理分辨率抓全屏（虚拟桌面）
-                int vx = System.Math.Max(0, (int)SystemParameters.VirtualScreenLeft);
-                int vy = System.Math.Max(0, (int)SystemParameters.VirtualScreenTop);
-                int vw = (int)SystemParameters.VirtualScreenWidth;
-                int vh = (int)SystemParameters.VirtualScreenHeight;
+                // 用物理分辨率抓整个虚拟桌面（SystemParameters 给的是 DIP，要乘 DPI）
+                DpiScale samplerDpi = VisualTreeHelper.GetDpi(this);
+                int vx = (int)Math.Round(SystemParameters.VirtualScreenLeft * samplerDpi.DpiScaleX);
+                int vy = (int)Math.Round(SystemParameters.VirtualScreenTop * samplerDpi.DpiScaleY);
+                int vw = (int)Math.Round(SystemParameters.VirtualScreenWidth * samplerDpi.DpiScaleX);
+                int vh = (int)Math.Round(SystemParameters.VirtualScreenHeight * samplerDpi.DpiScaleY);
 
-                using var bmp = new System.Drawing.Bitmap(vw * 5 / 4, vh * 5 / 4);
+                // 尺寸必须与 CopyFromScreen 的目标矩形一致，否则会留黑边/裁掉一截
+                using var bmp = new System.Drawing.Bitmap(Math.Max(1, vw), Math.Max(1, vh));
                 using (var g = System.Drawing.Graphics.FromImage(bmp))
                 {
                     g.CopyFromScreen(vx, vy, 0, 0, bmp.Size);
@@ -1127,6 +1280,7 @@ public partial class MainWindow : GlassWindow
             Diag.Log($"SAMPLE error: {ex.Message}");
         }
     }
+#endif
 
     /// <summary>
     /// 托盘左键 / 全局快捷键共用：可见就收起，不可见（或最小化）就唤出。
@@ -1165,6 +1319,8 @@ public partial class MainWindow : GlassWindow
             return;
         }
 
+        // 手动拖动期间隐藏：先把手势收掉，否则隐藏的窗口会继续跟着鼠标跑
+        AbortWindowDrag("hide to tray");
         CancelGesture();
 
         // 中断位移预测的回落动画并把偏移清零：带着非零偏移隐藏的话，
@@ -1240,9 +1396,11 @@ public partial class MainWindow : GlassWindow
         int targetLeft = Math.Clamp(r.Left, work.Left - width + minVisibleX, work.Right - minVisibleX);
         int targetTop = Math.Clamp(r.Top, work.Top - height + minVisibleY, work.Bottom - minVisibleY);
 
-        DpiScale dpi = VisualTreeHelper.GetDpi(this);
-        Left = targetLeft / dpi.DpiScaleX;
-        Top = targetTop / dpi.DpiScaleY;
+        // 用物理像素直接 SetWindowPos，而不是换算成 DIP 去写 Left/Top：
+        // Window.Left/Top 是 DIP，但"1 DIP 等于多少物理像素"取决于窗口当前所在（或即将去往）
+        // 的显示器。多显示器不同缩放时，用当前窗口 DPI 换算会偏 ~20%。
+        SetWindowPos(hwnd, IntPtr.Zero, targetLeft, targetTop, 0, 0,
+            SwpNosize | SwpNozorder | SwpNoactivate);
 
         Diag.Log($"EnsureOnScreen: ({r.Left},{r.Top}) -> ({targetLeft},{targetTop}) "
             + $"work=({work.Left},{work.Top},{work.Right},{work.Bottom})");
@@ -1322,7 +1480,8 @@ public partial class MainWindow : GlassWindow
         ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, growY, HandoffBehavior.SnapshotAndReplace);
 
         Dispatcher.BeginInvoke(PlayEntrance, DispatcherPriority.Loaded);
-        Dispatcher.BeginInvoke(FreezeBackdrop, DispatcherPriority.Loaded);
+        // 同上：Fire-and-forget 的时机不能直接传带可选参数的方法组
+        Dispatcher.BeginInvoke((Action)(() => FreezeBackdrop()), DispatcherPriority.Loaded);
     }
 
     /// <summary>
