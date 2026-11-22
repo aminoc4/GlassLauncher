@@ -1,11 +1,13 @@
 # GlassLauncher 原生版构建脚本（w64devkit / MinGW-w64 GCC）
-# 用法：pwsh -File build.ps1 [-OutDir D:\GlassLauncher-handoff\.agent\native] [-Release]
+# 用法：pwsh -File src/GlassLauncher.Native/build.ps1 [-OutDir <dir>]
 param(
-    [string]$OutDir = 'D:\GlassLauncher-handoff\.agent\native',
+    [string]$OutDir = '',
     [switch]$Release
 )
 
 $ErrorActionPreference = 'Stop'
+$root = Join-Path $PSScriptRoot '..\..'
+if (-not $OutDir) { $OutDir = Join-Path $root 'dist' }
 $src = Join-Path $PSScriptRoot 'src'
 $sources = Get-ChildItem $src -Filter *.cpp | ForEach-Object { $_.FullName }
 
@@ -25,8 +27,8 @@ $libs = @(
 
 Write-Host "g++ $($sources.Count) sources -> $exe"
 
-# 应用图标：把 WPF 版的 app.ico 编成资源 id 1（托盘/任务栏/窗口类共用）
-$icon = Join-Path $PSScriptRoot '..\GlassLauncher\app.ico'
+# 应用图标：编成资源 id 1（托盘/任务栏/窗口类共用）
+$icon = Join-Path $root 'app.ico'
 $iconRc = ($icon -replace '\\', '/')
 $rcFile = Join-Path $OutDir 'app.rc'
 $resFile = Join-Path $OutDir 'app.res'

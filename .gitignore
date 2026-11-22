@@ -1,4 +1,6 @@
 bin/
 obj/
 .agent/
+dist/
 *.user
+.vs/
