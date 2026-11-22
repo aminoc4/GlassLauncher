@@ -67,12 +67,15 @@ public partial class MainWindow : GlassWindow
     // 背景抓屏的垫边（DIP）：抓屏区域比窗口四周各大一圈。这圈垫边有两个用途 ——
     // 模糊采样在图像边缘会拿到透明而发暗（把淡出区推到窗外），
     // 以及给"帧随窗动"的拖动方式留出模糊淡出的余地。必须与 XAML 里
-    // FrozenLayerRoot 的 Margin=-24 + 2 倍放大严格一致，否则背景会与桌面错位。
+    // FrozenLayerRoot 的 Margin=-48 + 2 倍放大严格一致，否则背景会与桌面错位。
     private const double BackdropPad = 48;
 
     // 背景层降采样倍数：抓屏、位图、模糊的中间表面都按 1/2 线性尺寸做（面积 1/4）。
-    // 实测满分辨率下两个 BlurEffect 的中间表面合计吃 83MB 私有内存，是程序最大的单项开销；
-    // 背景本来就是模糊的，2 倍上采样看不出来。
+    //
+    // ⚠ 实测更正（2026-11-22）：曾经把"满分辨率下两个 BlurEffect 合计吃 83MB"写成结论，
+    // 但同机 A/B 证明这是错的（空 WPF 窗口私有提交 74MB，本应用 83MB，整个背景栈约 5MB；
+    // 见 MEASUREMENTS.md）。半分辨率真正的收益是 GPU 填充率/纹理带宽/抓屏上传量，
+    // 不是内存。保留它是因为拖动帧率与 CPU 更稳，不是因为它治内存。
     // XAML 里 FrozenLayerScale 必须等于它，模糊半径必须除以它。
     private const double BackdropDownscale = 2;
 
@@ -281,7 +284,8 @@ public partial class MainWindow : GlassWindow
         try
         {
             var stream = Application.GetResourceStream(new Uri("pack://application:,,,/app.ico")).Stream;
-            var icon = new System.Drawing.Icon(stream);
+            using var iconStream = stream;
+            var icon = new System.Drawing.Icon(iconStream);
 
             _tray = new Chrome.TrayIcon(icon, "Glass Launcher — 左键 打开/隐藏，右键 菜单");
             _tray.LeftClick += ToggleLauncherWindow;
@@ -486,7 +490,12 @@ public partial class MainWindow : GlassWindow
         // 手动拖动没有 WM_ENTERSIZEMOVE，live 由这里直接驱动
         StartDragRide();
 
-        _manualDragTimer ??= new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(15) };
+        // Render 优先级：拖动是 15ms 一拍的硬节拍，Background 会排在布局/渲染之后，
+        // 渲染一忙 SetWindowPos 就滞后，窗口看起来跟不上鼠标。
+        _manualDragTimer ??= new DispatcherTimer(DispatcherPriority.Render)
+        {
+            Interval = TimeSpan.FromMilliseconds(15),
+        };
         _manualDragTimer.Tick -= ManualDragTick;
         _manualDragTimer.Tick += ManualDragTick;
         _manualDragTimer.Start();
@@ -986,6 +995,7 @@ public partial class MainWindow : GlassWindow
             _surfaceFresh = false;
             _liveGrab?.Dispose();
             _liveGrab = null;
+            _glass.Dispose();
             _tray?.Dispose();
             Persist();
         };
@@ -1140,6 +1150,7 @@ public partial class MainWindow : GlassWindow
         ApplyBackdropProbe();
         SeedFromEnvironment();
         Loaded += (_, _) => RunDebugProbes();
+        StartDiagnosticHarness();
 #endif
 
         SyncGlassMode();
@@ -1265,7 +1276,7 @@ public partial class MainWindow : GlassWindow
             DpiScale dpi = VisualTreeHelper.GetDpi(this);
             Point origin = PointToScreen(new Point(0, 0));
             // 与显示端同套几何：抓屏区域比窗口四周各大 BackdropPad，
-            // 显示端 Margin=-24 + 2 倍放大恰好覆盖同一个 DIP 范围，背景与桌面对齐。
+            // 显示端 Margin=-48 + 2 倍放大恰好覆盖同一个 DIP 范围，背景与桌面对齐。
             // 下面两套尺寸：full* 是屏幕上的物理像素区域（抓屏源），width/height 是
             // 降采样后的位图尺寸（显示用），两者只差一个 BackdropDownscale。
             int fullWidth = (int)Math.Ceiling((ActualWidth + (BackdropPad * 2)) * dpi.DpiScaleX);
@@ -1288,6 +1299,15 @@ public partial class MainWindow : GlassWindow
             int captureX = (int)Math.Round(origin.X - (BackdropPad * dpi.DpiScaleX));
             int captureY = (int)Math.Round(origin.Y - (BackdropPad * dpi.DpiScaleY));
             byte[]? reusable = _freezePixels;
+
+            // 高水位收缩：最大化过一次之后 _freezePixels 可能是两倍以上大小，
+            // 还原后没必要一直留着（ScreenGrab 只要求 length >= 需要量）。
+            int neededBytes = width * height * 4;
+            if (reusable is not null && reusable.Length > neededBytes * 2)
+            {
+                reusable = null;
+                _freezePixels = null;
+            }
 
             // 抓屏在工作线程做（整窗 BitBlt + 降采样，~5ms）：松手瞬间和启动第一帧
             // 都是用户最敏感的时机，不能让 UI 线程在这上面停顿。
@@ -1388,7 +1408,35 @@ public partial class MainWindow : GlassWindow
             _freezeFrames[index] = frame;
         }
 
+        // 另一个槽如果还是旧尺寸（最大化/缩放留下的高水位），直接丢掉：
+        // 它此刻既没有被显示（调用方已 CommitFrozenFade），也没有复用价值。
+        int other = 1 - index;
+        if (_freezeFrames[other] is { } stale
+            && (stale.PixelWidth != width || stale.PixelHeight != height))
+        {
+            _freezeFrames[other] = null;
+        }
+
         return frame;
+    }
+
+    /// <summary>
+    /// 隐藏到托盘后收缩冻结帧缓存：丢掉备用位图和像素缓冲（正在显示的那块保留，
+    /// 避免唤出瞬间白屏；下一次 FreezeBackdrop 会替换它）。
+    /// 不是内存泄漏，而是把最大化/大尺寸留下的高水位还给系统。
+    /// </summary>
+    private void ShrinkFreezeCache()
+    {
+        WriteableBitmap? displayed = FrozenSurface.Source as WriteableBitmap;
+        for (int i = 0; i < _freezeFrames.Length; i++)
+        {
+            if (!ReferenceEquals(_freezeFrames[i], displayed))
+            {
+                _freezeFrames[i] = null;
+            }
+        }
+
+        _freezePixels = null;
     }
 
     /// <summary>
@@ -1612,6 +1660,11 @@ public partial class MainWindow : GlassWindow
             Diag.Log("HideToTray fade completed -> Hide()");
             Hide();
             ResetShellTransform();
+
+            // 托盘常驻应用的大部分时间都在隐藏态：把 live 抓帧的 DIB/位图/缓冲池
+            // 还给系统（下次拖动会自动重建），并丢掉已经过时的冻结帧高水位。
+            _liveGrab?.ReleaseIdle();
+            ShrinkFreezeCache();
         };
 
         Shell.BeginAnimation(OpacityProperty, fade, HandoffBehavior.SnapshotAndReplace);
@@ -2224,7 +2277,7 @@ public partial class MainWindow : GlassWindow
         _ghost.Lift();
 
         _autoScrollDelta = 0;
-        _autoScrollTimer.Start();
+        _autoScrollTimer.Stop();
 
 #if DEBUG
         _dragClock.Restart();
@@ -2393,6 +2446,17 @@ public partial class MainWindow : GlassWindow
         else
         {
             _autoScrollDelta = 0;
+        }
+
+        // 只在指针压到上下沿时开 16ms 节拍：整个图标拖动期间无条件空转的
+        // DispatcherTimer 是纯浪费（AutoScrollTick 每次都直接 return）。
+        if (_autoScrollDelta == 0)
+        {
+            _autoScrollTimer.Stop();
+        }
+        else if (!_autoScrollTimer.IsEnabled)
+        {
+            _autoScrollTimer.Start();
         }
     }
 
@@ -2683,10 +2747,19 @@ public partial class MainWindow : GlassWindow
         LaunchResult result = LaunchResult.Failed;
         string? error = null;
 
-        await Task.Run(() =>
+        try
         {
-            result = LaunchService.TryLaunch(entry, asAdministrator, out error);
-        });
+            await Task.Run(() =>
+            {
+                result = LaunchService.TryLaunch(entry, asAdministrator, out error);
+            });
+        }
+        catch (Exception ex)
+        {
+            // async void：ShellExecute 的异常（COM/权限/OLE）不能漏给全局处理器
+            error = $"{ex.GetType().Name}: {ex.Message}";
+            Diag.Log($"LaunchEntry 失败：{error}");
+        }
 
         switch (result)
         {

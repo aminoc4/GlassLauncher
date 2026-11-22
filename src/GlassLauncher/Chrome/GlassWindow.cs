@@ -154,7 +154,19 @@ public class GlassWindow : Window
 
         SizeChanged += (_, _) => ApplyCornerMode();
         StateChanged += (_, _) => ApplyCornerMode();
-        DpiChanged += (_, _) => ApplyCornerMode(force: true);
+        // 实测会收到大量 "1.25 -> 1.25" 的假事件：每次都会走 ApplyCornerMode(force: true)
+        // → SWP_FRAMECHANGED 全量非客户区重算（还可能连带一次 DWM 表面重建）。
+        // 只有 DPI 真的变了才需要重算非客户区。
+        DpiChanged += (_, e) =>
+        {
+            if (e.OldDpi.DpiScaleX == e.NewDpi.DpiScaleX
+                && e.OldDpi.DpiScaleY == e.NewDpi.DpiScaleY)
+            {
+                return;
+            }
+
+            ApplyCornerMode(force: true);
+        };
     }
 
     /// <summary>

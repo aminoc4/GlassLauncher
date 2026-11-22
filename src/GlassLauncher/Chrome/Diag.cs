@@ -17,10 +17,25 @@ internal static class Diag
 
     private static readonly object Gate = new();
 
-    internal static readonly string LogPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "GlassLauncher",
-        "glass.log");
+    internal static readonly string LogPath = ResolveLogPath();
+
+    /// <summary>
+    /// 日志位置。测试/便携场景可用 GLASSLAUNCHER_LOG_DIR 指到别处，
+    /// 避免污染用户真实目录（回归测试要求在沙箱/临时目录里也能拿到日志）。
+    /// </summary>
+    private static string ResolveLogPath()
+    {
+        string? dir = Environment.GetEnvironmentVariable("GLASSLAUNCHER_LOG_DIR");
+        if (!string.IsNullOrWhiteSpace(dir))
+        {
+            return Path.Combine(dir, "glass.log");
+        }
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "GlassLauncher",
+            "glass.log");
+    }
 
     private static readonly bool Verbose = ResolveVerbose();
 

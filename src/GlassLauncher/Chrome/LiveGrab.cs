@@ -40,6 +40,9 @@ internal sealed class LiveGrab : IDisposable
     private volatile bool _running;
     private bool _started;
 
+    /// <summary>UI 线程请求"进入长空闲"：工作线程下次醒来时把 GDI 资源还给系统。</summary>
+    private volatile bool _releaseRequested;
+
     // UI 线程写入、工作线程读取的帧请求（lock 保护）
     private readonly object _gate = new();
     private bool _pending;
@@ -59,8 +62,8 @@ internal sealed class LiveGrab : IDisposable
     private int _height;
 
     // 上传缓冲池：工作线程借、UI 线程归还（WritePixels 之后）。
-    // 上限 2：每块是整窗 4MB（1170×820×4），留多了就是白占内存；UI 跟不上时
-    // 宁可多借一次新数组（临时垃圾），也不让池子无上限长大。
+    // 上限 2：每块是降采样后的整窗（585×410×4 ≈ 0.92MB；满分辨率才是 3.8MB），
+    // 留多了就是白占内存；UI 跟不上时宁可多借一次新数组（临时垃圾），也不让池子无上限长大。
     private const int MaxPooledBuffers = 2;
     private readonly System.Collections.Concurrent.ConcurrentQueue<byte[]> _spareBuffers = new();
 
@@ -125,6 +128,33 @@ internal sealed class LiveGrab : IDisposable
     /// <summary>每轮拖动开始时调用：重新武装预热帧计数（排除刚开，前几帧带自己）。</summary>
     public void ResetWarmup(int frames) => _warmupLeft = frames;
 
+    /// <summary>
+    /// UI 线程调用：进入长空闲（隐藏到托盘、停止使用背景抓帧）时释放 GDI 资源、
+    /// 位图与缓冲池。工作线程本身保留，下次 Submit 直接复用；下次拖动会自动重建
+    /// （PumpLoop 里 _memoryDc == 0 的分支）。托盘常驻应用的大部分时间都在隐藏态，
+    /// 这些资源（DIB 0.92MB + 位图/纹理 + 池块 + 3 个 GDI 对象）没有理由一直占着。
+    /// </summary>
+    public void ReleaseIdle()
+    {
+        if (!_started)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            _pending = false;
+        }
+
+        _bitmap = null;
+        while (_spareBuffers.TryDequeue(out _))
+        {
+        }
+
+        _releaseRequested = true;
+        _signal.Set();
+    }
+
     private void PumpLoop()
     {
         while (_running)
@@ -133,6 +163,14 @@ internal sealed class LiveGrab : IDisposable
             if (!_running)
             {
                 break;
+            }
+
+            // 空闲释放请求：把 GDI 资源还给系统，然后继续处理（可能同时有一个新的抓帧请求）。
+            // 不能在这里 continue —— 那会把已经排队的请求晾着，而信号量不会再响。
+            if (_releaseRequested)
+            {
+                _releaseRequested = false;
+                ReleaseGdi();
             }
 
             int x, y, w, h, sourceW, sourceH;

@@ -187,14 +187,14 @@ public static class LauncherStore
 
     private static string ResolveDataDirectory()
     {
-        // 调试期允许把数据目录指到别处，便于用独立数据文件验证持久化而不污染真实数据
-#if DEBUG
+        // 允许把数据目录指到别处：便于用独立数据文件验证持久化而不污染真实数据，
+        // 也让自动化回归可以在临时目录里跑（不再要求 DEBUG 构建）。
         string? overrideDir = Environment.GetEnvironmentVariable("GLASSLAUNCHER_DATA_DIR");
         if (!string.IsNullOrWhiteSpace(overrideDir))
         {
             return overrideDir;
         }
-#endif
+
         return Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "GlassLauncher");

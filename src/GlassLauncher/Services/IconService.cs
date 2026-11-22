@@ -33,10 +33,10 @@ public static class IconService
     /// <summary>
     /// 解码上限（像素）。缓存里的 PNG 是 256px，全尺寸解码后每个图标占 256×256×4 ≈ 250KB，
     /// 40 个条目就是 10MB+；而界面最大只画到 56 DIP（悬停放大 10% → 62 DIP，
-    /// 200% DPI 下 123px）。128px 解码足够清晰，内存直接降到四分之一，解码也更快。
-    /// 小图（原本就 ≤128）保持原样，不做无谓的放大。
+    /// 200% DPI 下 123px）。96px 解码足够清晰（对 70px 显示约 1.37×，不超过 1.5× 过采样上限），
+    /// 内存降到约 1/7，解码也更快。小图（原本就 ≤96）保持原样，不做无谓的放大。
     /// </summary>
-    private const int MaxDecodeSize = 128;
+    private const int MaxDecodeSize = 96;
 
     private static readonly string CacheDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
