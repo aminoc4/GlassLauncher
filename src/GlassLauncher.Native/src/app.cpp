@@ -753,6 +753,15 @@ bool LauncherApp::CreateMainWindow()
 
     int pref = 2; // DWMWCP_ROUND
     DwmSetWindowAttribute(hwnd_, 33, &pref, sizeof(pref));
+
+    // Win11 会给带边框的窗口画一圈 1px 的系统边框（浅色模式下是白线），
+    // 我们的客户区铺满整窗，这圈线正好落在画面上、沿窗口轮廓连成一圈 ——
+    // 用户反馈的"靠近边缘的白线"就是它。DWMWA_COLOR_NONE 关掉。
+    {
+        DWORD noBorder = 0xFFFFFFFE; // DWMWA_COLOR_NONE
+        DwmSetWindowAttribute(hwnd_, 34 /* DWMWA_BORDER_COLOR */, &noBorder, sizeof(noBorder));
+    }
+
     UpdateWindowRegion();
 
     CreateSearchEdit();
@@ -854,30 +863,15 @@ void LauncherApp::Paint()
 
     // 玻璃棱线用渐变而不是纯白 1px：纯白描边在亮背景上就是一条扎眼的白线，
     // mac 的观感是"左上受光明亮 → 右下压暗"，渐变才能撑出厚度。
+    // 用户反馈"贴近窗口轮廓的一圈白线"。排查结论：Win11 系统边框（已关）+ 自绘的整圈窗框线 +
+    // 顶部高光三者叠加。这里把最外圈窗框线和顶部高光都去掉，只留面板棱一点点受光，
+    // 窗口边界交给 DWM 阴影和圆角。
     D2D1_GRADIENT_STOP panelStops[3] = {
-        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, dark_ ? 0.42f : 0.60f)},
-        {0.45f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.18f)},
-        {1.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, dark_ ? 0.30f : 0.22f)},
+        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, dark_ ? 0.10f : 0.14f)},
+        {0.45f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.04f)},
+        {1.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, dark_ ? 0.16f : 0.10f)},
     };
     renderer_.StrokeRoundRectGradient(panel, 16.0f, panelStops, 3, 1.0f, true);
-
-    D2D1_GRADIENT_STOP windowStops[3] = {
-        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, dark_ ? 0.50f : 0.80f)},
-        {0.45f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f)},
-        {1.0f, D2D1::ColorF(0.0f, 0.0f, 0.0f, dark_ ? 0.36f : 0.28f)},
-    };
-    renderer_.StrokeRoundRectGradient(D2D1::RectF(0.5f, 0.5f, widthDip_ - 0.5f, heightDip_ - 0.5f),
-        8.0f, windowStops, 3, 1.0f, true);
-
-    D2D1_GRADIENT_STOP specularStops[5] = {
-        {0.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f)},
-        {0.12f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.50f)},
-        {0.5f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.82f)},
-        {0.88f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.50f)},
-        {1.0f, D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.0f)},
-    };
-    renderer_.FillRectGradient(D2D1::RectF(22.0f, 0.5f, widthDip_ - 22.0f, 1.5f),
-        specularStops, 5, true);
 
     DrawStatusBar();
 
