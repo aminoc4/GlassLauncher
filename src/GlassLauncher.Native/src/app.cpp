@@ -1,5 +1,6 @@
 #include "app.h"
 #include "settings.h"
+#include "prompt.h"
 
 #include <d2d1helper.h>
 #include <dwmapi.h>
@@ -356,8 +357,8 @@ void LauncherApp::ShowItemMenu(int index)
     AppendMenuW(menu, MF_STRING, 3, L"在资源管理器中打开");
     AppendMenuW(menu, MF_STRING, 4, L"移除");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 5, L"重命名…");
-    AppendMenuW(menu, MF_STRING | MF_GRAYED, 6, L"重新指定目标…");
+    AppendMenuW(menu, MF_STRING, 5, L"重命名…");
+    AppendMenuW(menu, MF_STRING, 6, L"重新指定目标…");
 
     POINT pt = {};
     GetCursorPos(&pt);
@@ -377,7 +378,48 @@ void LauncherApp::ShowItemMenu(int index)
             break;
         }
         case 4: RemoveEntry(index); break;
+
+        case 5: // 重命名
+        {
+            std::wstring name = e.displayName;
+            if (PromptDialog::ShowModal(hwnd_, instance_, L"重命名", L"显示名称", name, name) && !name.empty())
+            {
+                entries_[index].displayName = name;
+                SaveEntriesLogged();
+                ScheduleRepaint();
+                Log("renamed entry %d -> %ls", index, name.c_str());
+            }
+            break;
+        }
+
+        case 6: // 重新指定目标
+        {
+            std::wstring path = e.targetPath;
+            if (PromptDialog::ShowModal(hwnd_, instance_, L"重新指定目标",
+                    L"目标路径（.exe / .lnk / .url / 文件夹）", path, path) && !path.empty())
+            {
+                entries_[index].targetPath = path;
+                if (icons_[index]) { icons_[index]->Release(); icons_[index] = nullptr; }
+                icons_[index] = renderer_.LoadIconFromPath(path);
+                entries_[index].isBroken = GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES
+                    && _wcsnicmp(path.c_str(), L"http", 4) != 0;
+                SaveEntriesLogged();
+                ScheduleRepaint();
+                Log("retargeted entry %d", index);
+            }
+            break;
+        }
+
         default: break;
+    }
+}
+
+void LauncherApp::SaveEntriesLogged()
+{
+    std::wstring error;
+    if (!Store::SaveEntries(entries_, &error))
+    {
+        LogW((L"保存失败：" + error).c_str());
     }
 }
 
@@ -563,6 +605,8 @@ int LauncherApp::Run(HINSTANCE instance)
         return 1;
     }
     rendererReady_ = true;
+    UpdateWindowRegion();
+    LayoutChildren();
     liveCapture_.Start(hwnd_);
 
     LoadIcons();
@@ -649,7 +693,9 @@ bool LauncherApp::CreateMainWindow()
     wc.lpfnWndProc = WndProcStatic;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    if (!wc.hIcon) wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wc.hIconSm = wc.hIcon;
     wc.hbrBackground = CreateSolidBrush(dark_ ? RGB(0x20, 0x20, 0x24) : RGB(0xF4, 0xF6, 0xFA));
     wc.lpszClassName = L"GlassLauncherNative";
     if (!RegisterClassExW(&wc))
@@ -753,6 +799,9 @@ void LauncherApp::Paint()
     // 这里必须保持 Identity，不能再乘一次 dpi_（否则整窗布局被放大 1.25²）。
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
 
+    // 先用不透明底色清屏：任何"背景位图没盖到"的边缘都不会透出桌面（透明感 bug 的根因之一）
+    rt->Clear(dark_ ? D2D1::ColorF(0.13f, 0.14f, 0.17f) : D2D1::ColorF(0.91f, 0.93f, 0.97f));
+
     if (GetEnvironmentVariableW(L"GL_NATIVE_DEBUG_RED", nullptr, 0) > 0)
     {
         renderer_.FillRect(D2D1::RectF(0, 0, widthDip_, heightDip_), D2D1::ColorF(1, 0, 0));
@@ -831,11 +880,15 @@ void LauncherApp::DrawBackdrop()
             shiftY = (float)(backdrop_.OriginY() - wr.top) / dpi_;
         }
 
-        float bitmapWidth = (float)backdrop_.WidthPx() * Backdrop::Downscale / dpi_;
-        float bitmapHeight = (float)backdrop_.HeightPx() * Backdrop::Downscale / dpi_;
+        // 平移不能超过垫边，否则位图覆盖不到窗口的另一边
+        shiftX = std::clamp(shiftX, -PadDip, PadDip);
+        shiftY = std::clamp(shiftY, -PadDip, PadDip);
+
+        // 目标尺寸按【当前窗口】算（不是位图自己的尺寸）：缩放期间旧帧尺寸可能偏小，
+        // 拉伸铺满也比在底部/右侧留一条透出桌面的缝要好。
         D2D1_RECT_F dest = D2D1::RectF(
             -PadDip + shiftX, -PadDip + shiftY,
-            -PadDip + shiftX + bitmapWidth, -PadDip + shiftY + bitmapHeight);
+            widthDip_ + PadDip + shiftX, heightDip_ + PadDip + shiftY);
         rt->DrawBitmap(backdrop_.Bitmap(), dest, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     }
     else
@@ -962,10 +1015,31 @@ void LauncherApp::DrawItemTile(int entry, float x, float y, bool hover, float al
     D2D1_COLOR_F plate = hover ? colors_.hoverPlate : colors_.iconPlate;
     plate.a *= alpha;
     D2D1_RECT_F tile = D2D1::RectF(x + 22.0f, y, x + 90.0f, y + 68.0f);
-    renderer_.FillRoundRect(tile, 17.0f, plate);
-    renderer_.StrokeRoundRect(tile, 17.0f, colors_.iconPlateBorder, 1.0f);
 
-    D2D1_RECT_F iconRect = D2D1::RectF(tile.left + 6.0f, tile.top + 6.0f, tile.left + 62.0f, tile.top + 62.0f);
+    float scale = 1.0f;
+    if (entry < (int)hoverProgress_.size() && hoverProgress_[entry] > 0.0f)
+    {
+        float t = hoverProgress_[entry];
+        t = t * t * (3.0f - 2.0f * t); // smoothstep
+        scale = 1.0f + 0.10f * t;
+    }
+
+    if (scale != 1.0f)
+    {
+        D2D1_POINT_2F center = D2D1::Point2F((tile.left + tile.right) * 0.5f,
+                                             (tile.top + tile.bottom) * 0.5f);
+        tile = D2D1::RectF(center.x + (tile.left - center.x) * scale,
+                           center.y + (tile.top - center.y) * scale,
+                           center.x + (tile.right - center.x) * scale,
+                           center.y + (tile.bottom - center.y) * scale);
+    }
+
+    renderer_.FillRoundRect(tile, 17.0f * scale, plate);
+    renderer_.StrokeRoundRect(tile, 17.0f * scale, colors_.iconPlateBorder, 1.0f);
+
+    float inset = 6.0f * scale;
+    D2D1_RECT_F iconRect = D2D1::RectF(tile.left + inset, tile.top + inset,
+        tile.right - inset, tile.bottom - inset);
     if (icons_[entry])
     {
         rt->DrawBitmap(icons_[entry], iconRect, alpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
@@ -1068,6 +1142,21 @@ void LauncherApp::OnLiveCaptureReady()
 
     if (!liveCapture_.TakeReady(&pixels, &width, &height, &origin)) return;
 
+    // 只在拖动/缩放进行中接受实时帧；结束后的在途帧会覆盖刚抓好的静态帧，
+    // 造成"底部一条没盖到"之类的透明缝（旧帧尺寸比窗口小）。尺寸不匹配也丢。
+    bool active = windowDrag_ || windowResize_;
+    RECT wr = {};
+    GetWindowRect(hwnd_, &wr);
+    int padPx = (int)(48.0f * dpi_);
+    int expectedWidth = ((wr.right - wr.left) + padPx * 2 + 1) / 2;
+    int expectedHeight = ((wr.bottom - wr.top) + padPx * 2 + 1) / 2;
+
+    if (!active || width != expectedWidth || height != expectedHeight)
+    {
+        liveCapture_.ReleaseBuffer();
+        return;
+    }
+
     if (backdrop_.AdoptPixels(pixels, width, height, origin.x, origin.y, renderer_))
     {
         liveFrames_++;
@@ -1097,12 +1186,7 @@ void LauncherApp::UpdateWindowRegion()
     if (region)
     {
         int ok = SetWindowRgn(hwnd_, region, TRUE);
-        static bool logged = false;
-        if (!logged)
-        {
-            logged = true;
-            Log("window region %ldx%ld radius=%d set=%d err=%lu", rc.right, rc.bottom, radius, ok, ok ? 0UL : GetLastError());
-        }
+        Log("window region %ldx%ld radius=%d set=%d err=%lu", rc.right, rc.bottom, radius, ok, ok ? 0UL : GetLastError());
     }
 }
 
@@ -1138,8 +1222,44 @@ void LauncherApp::OnMouseMove(POINT clientDip)
     if (hit != hover_)
     {
         hover_ = hit;
+        SetTimer(hwnd_, 6 /* TIMER_HOVER */, 16, nullptr);
         ScheduleRepaint();
     }
+}
+
+void LauncherApp::TickHoverAnimation()
+{
+    if (hoverProgress_.size() != entries_.size())
+    {
+        hoverProgress_.resize(entries_.size(), 0.0f);
+    }
+
+    const float step = 16.0f / 180.0f; // ~180ms 完成
+    bool changed = false;
+
+    for (size_t i = 0; i < hoverProgress_.size(); i++)
+    {
+        float target = ((int)i == hover_ && !itemDrag_) ? 1.0f : 0.0f;
+        float value = hoverProgress_[i];
+        if (value < target)
+        {
+            value = (std::min)(target, value + step);
+            hoverProgress_[i] = value;
+            changed = true;
+        }
+        else if (value > target)
+        {
+            value = (std::max)(target, value - step);
+            hoverProgress_[i] = value;
+            changed = true;
+        }
+    }
+
+    if (!changed)
+    {
+        KillTimer(hwnd_, 6);
+    }
+    ScheduleRepaint();
 }
 
 void LauncherApp::OnLeftDown(POINT clientDip)
@@ -1319,6 +1439,7 @@ void LauncherApp::StopWindowResize()
     if (resizeTimer_) { KillTimer(hwnd_, 5); resizeTimer_ = 0; }
     ReleaseCapture();
     Log("window resize end");
+    liveCapture_.DropReady();
     RebuildBackdrop();
     ScheduleRepaint();
 }
@@ -1365,6 +1486,7 @@ void LauncherApp::StopWindowDrag()
         liveFrames_ > 0 ? liveCaptureMs_ / liveFrames_ : 0.0,
         liveFrames_ > 0 ? liveUploadMs_ / liveFrames_ : 0.0,
         backdrop_.LastBltMs(), backdrop_.LastBlurMs());
+    liveCapture_.DropReady();
     RebuildBackdrop();
     ScheduleRepaint();
 
@@ -1445,6 +1567,7 @@ void LauncherApp::ToggleVisible()
 void LauncherApp::ShowLauncher()
 {
     // 先抓背景再显示：窗口不可见时抓到的是干净的桌面（隐藏期间桌面可能已经变了）
+    liveCapture_.DropReady();
     if (!IsWindowVisible(hwnd_) || IsIconic(hwnd_))
     {
         backdrop_.CapturePixels(hwnd_, dpi_, settings_.blurRadius);
@@ -1503,7 +1626,8 @@ void LauncherApp::InitTray()
     tray_.uID = 1;
     tray_.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray_.uCallbackMessage = WM_TRAYICON;
-    tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    tray_.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(1));
+    if (!tray_.hIcon) tray_.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(tray_.szTip, L"Glass Launcher — 左键 打开/隐藏，右键 菜单");
     trayAdded_ = Shell_NotifyIconW(NIM_ADD, &tray_) != FALSE;
     Log("tray added=%d", trayAdded_ ? 1 : 0);
@@ -1593,15 +1717,12 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
     switch (msg)
     {
         case WM_NCCALCSIZE:
-            // 客户区铺满整个窗口（自绘标题栏）
-            if (w)
-            {
-                auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(l);
-                RECT wr = {};
-                GetWindowRect(hwnd, &wr);
-                params->rgrc[0] = wr;
-                return 0;
-            }
+            // 客户区铺满整个窗口（自绘标题栏）。
+            // 实测：wParam=TRUE 时 rgrc[0] 已经是"新窗口矩形"（= 想要的客户区），
+            // 直接 return 0 即可；千万不要把它改成 rgrc[1]（那是旧窗口矩形），
+            // 否则缩放时客户区停在旧大小：WM_SIZE 不触发、底部/右侧露出一条桌面
+            // （用户报的"最底部完全透明"）。
+            if (w) return 0;
             break;
 
         case WM_NCHITTEST:
@@ -1719,21 +1840,26 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             break;
 
         case WM_SIZE:
-            if (rendererReady_)
+        {
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            if (rc.right > 0 && rc.bottom > 0)
             {
-                RECT rc = {};
-                GetClientRect(hwnd, &rc);
-                if (rc.right > 0 && rc.bottom > 0)
-                {
-                    renderer_.Resize((UINT)(rc.right - rc.left), (UINT)(rc.bottom - rc.top), dpi_);
-                }
-                if (scroll_ > ScrollMax()) scroll_ = ScrollMax();
+                // 圆角区域/子控件布局与渲染器无关：启动早期 renderer 还没建好时也要跟上，
+                // 否则窗口区域会停在"带边框的旧客户区"，底部/右侧露出桌面（透明条 bug）。
                 UpdateWindowRegion();
                 LayoutChildren();
-                RebuildBackdrop();
-                ScheduleRepaint();
+
+                if (rendererReady_)
+                {
+                    renderer_.Resize((UINT)(rc.right - rc.left), (UINT)(rc.bottom - rc.top), dpi_);
+                    if (scroll_ > ScrollMax()) scroll_ = ScrollMax();
+                    RebuildBackdrop();
+                    ScheduleRepaint();
+                }
             }
             return 0;
+        }
 
         case WM_DPICHANGED:
         {
@@ -1841,6 +1967,11 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             if (w == 5) // TIMER_RESIZE
             {
                 TickWindowResize();
+                return 0;
+            }
+            if (w == 6) // TIMER_HOVER
+            {
+                TickHoverAnimation();
                 return 0;
             }
             if (w == 4) // TIMER_AUTO_EXIT（测试用）

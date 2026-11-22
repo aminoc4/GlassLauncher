@@ -31,6 +31,9 @@ public:
     /// UI 线程（收到 WM_APP_LIVE_CAPTURE 后调用）：取走最新一帧。
     bool TakeReady(const uint32_t** pixels, int* width, int* height, POINT* origin);
 
+    /// UI 线程：丢弃还没取走的就绪帧（结束拖动/缩放、准备重新静态锚定时调用）。
+    void DropReady();
+
     /// UI 线程：上传完成后把缓冲还给工作线程。
     void ReleaseBuffer();
 

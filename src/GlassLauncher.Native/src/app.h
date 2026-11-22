@@ -48,6 +48,7 @@ private:
     // ── 交互状态 ──
     int hover_ = -1;
     int press_ = -1;
+    std::vector<float> hoverProgress_;   // 每格 0..1 的悬停放大进度（16ms 节拍刷新）
     int dragFrom_ = -1;
     int dragTo_ = -1;
     POINT dragStartPt_ = {};
@@ -135,9 +136,11 @@ private:
     void OnLeftDown(POINT clientDip);
     void OnLeftUp(POINT clientDip);
     void OnMouseWheel(int delta);
+    void TickHoverAnimation();
     void ShowItemMenu(int index);
     void RemoveEntry(int index);
     void MoveEntry(int from, int to);
+    void SaveEntriesLogged();
     void HandleDroppedFiles(HDROP drop);
     void RebuildVisible();
     void LayoutChildren();

@@ -24,7 +24,25 @@ $libs = @(
 )
 
 Write-Host "g++ $($sources.Count) sources -> $exe"
-& g++ @flags @sources @libs -o $exe
+
+# 应用图标：把 WPF 版的 app.ico 编成资源 id 1（托盘/任务栏/窗口类共用）
+$icon = Join-Path $PSScriptRoot '..\GlassLauncher\app.ico'
+$iconRc = ($icon -replace '\\', '/')
+$rcFile = Join-Path $OutDir 'app.rc'
+$resFile = Join-Path $OutDir 'app.res'
+if (Test-Path $icon) {
+    "1 ICON `"$iconRc`"" | Set-Content $rcFile -Encoding ASCII
+    & windres $rcFile -O coff -o $resFile
+    if ($LASTEXITCODE -ne 0) { throw "windres failed ($LASTEXITCODE)" }
+} else {
+    Write-Host "warning: app.ico not found at $icon"
+    $resFile = $null
+}
+
+$linkInputs = @()
+if ($resFile) { $linkInputs += $resFile }
+
+& g++ @flags @sources @linkInputs @libs -o $exe
 if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 
 $size = (Get-Item $exe).Length

@@ -109,6 +109,16 @@ bool LiveCapture::TakeReady(const uint32_t** pixels, int* width, int* height, PO
     return true;
 }
 
+void LiveCapture::DropReady()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (readyIndex_ >= 0)
+    {
+        free_.push_back(readyIndex_);
+        readyIndex_ = -1;
+    }
+}
+
 void LiveCapture::ReleaseBuffer()
 {
     std::lock_guard<std::mutex> lock(mutex_);
