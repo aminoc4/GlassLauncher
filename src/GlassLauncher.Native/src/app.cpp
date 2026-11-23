@@ -40,12 +40,13 @@ constexpr float ItemH = 122.0f;
 constexpr float ItemStride = 120.0f;
 constexpr float GridLeft = 32.0f;
 constexpr float GridTopDip = 92.0f;
-// 搜索胶囊：固定尺寸、居中于主窗口启动宽度（840 DIP）。胶囊整体就是一个可点击的输入区，
-// 文字在其中水平居中（空态显示占位提示 + 居中光标），不再单独摆一个左侧放大镜。
-constexpr float SEARCH_PILL_CENTER_DIP = 420.0f;
+// 搜索胶囊：固定宽度、始终水平居中于【当前窗口】；文字左对齐（光标在最左），
+// 类似系统任务栏搜索框，而不是把文字摆在胶囊正中。
 constexpr float SEARCH_PILL_HALF_W_DIP = 190.0f;
 constexpr float SEARCH_PILL_TOP_DIP = 8.0f;
 constexpr float SEARCH_PILL_BOTTOM_DIP = 38.0f;
+constexpr float SEARCH_TEXT_LEFT_INSET_DIP = 40.0f;
+constexpr float SEARCH_TEXT_RIGHT_INSET_DIP = 14.0f;
 
 float ClientWidthDip(HWND hwnd, float dpi)
 {
@@ -297,59 +298,26 @@ void LauncherApp::LayoutChildren()
 {
     if (!searchEdit_) return;
 
-    // EDIT 是"可见文字的唯一来源"（保证 ClearType/IME/光标都是系统实现），
-    // 宽度跟着文本长度走、整体在胶囊里水平居中：点胶囊任意位置聚焦，
-    // 空态光标/占位提示自然落在正中。
-    D2D1_RECT_F pill = SearchPillRect();
+    // 输入框占满"放大镜右侧 → 胶囊右侧"的文本区：文字左对齐，光标在最左（类似系统搜索框）。
+    // 高度贴合字体行高并在胶囊里垂直居中（Win32 单行 EDIT 的文字从顶部排，编辑框过高会显得偏上）。
     D2D1_RECT_F text = SearchTextRect();
+    D2D1_RECT_F pill = SearchPillRect();
 
-    int textPx = 0;
     int linePx = (int)(18 * dpi_);
     HDC dc = GetDC(searchEdit_);
     HGDIOBJ old = searchFont_ ? SelectObject(dc, searchFont_) : nullptr;
     TEXTMETRICW tm = {};
     GetTextMetricsW(dc, &tm);
     if (tm.tmHeight > 0) linePx = tm.tmHeight;
-    if (!searchText_.empty())
-    {
-        SIZE extent = {};
-        GetTextExtentPoint32W(dc, searchText_.c_str(), (int)searchText_.size(), &extent);
-        textPx = extent.cx;
-    }
-    else
-    {
-        SIZE extent = {};
-        const wchar_t* cue = L"搜索";
-        GetTextExtentPoint32W(dc, cue, 2, &extent);
-        textPx = extent.cx;
-    }
     if (old) SelectObject(dc, old);
     ReleaseDC(searchEdit_, dc);
 
-    int textAreaWidthDip = (int)(text.right - text.left);
-    int widthDip = 0;
-    if (searchText_.empty())
-    {
-        // 空态：聚焦时把 EDIT 收窄到光标附近，插入符正好落在胶囊正中；
-        // 未聚焦时留出占位提示的宽度。
-        widthDip = searchFocused_ ? 8 : 72;
-    }
-    else
-    {
-        widthDip = std::min(textAreaWidthDip, (int)(textPx / dpi_) + 18);
-        widthDip = std::max(widthDip, 40);
-    }
-    int xDip = (int)((text.left + text.right) * 0.5f) - widthDip / 2;
     int heightPx = linePx + (int)(4 * dpi_);
-
-    // 垂直居中：EDIT 内部文字是从顶部往下排的，所以 EDIT 必须贴合"字体行高 + 少量内边距"，
-    // 再把整个 EDIT 摆到胶囊的垂直中心——之前 EDIT 高 26 DIP、字体只有 ~16 DIP，
-    // 文字就贴在胶囊上半部（用户看到的"上下不居中"）。
     int yPx = (int)(((pill.top + pill.bottom) * 0.5f * dpi_) - heightPx * 0.5f + 0.5f);
 
     SetWindowPos(searchEdit_, nullptr,
-        (int)(xDip * dpi_ + 0.5f), yPx,
-        (int)(widthDip * dpi_ + 0.5f), heightPx,
+        (int)(text.left * dpi_ + 0.5f), yPx,
+        (int)((text.right - text.left) * dpi_ + 0.5f), heightPx,
         SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
@@ -1092,15 +1060,19 @@ void LauncherApp::DrawSearchBar()
 
 D2D1_RECT_F LauncherApp::SearchPillRect() const
 {
-    return D2D1::RectF(SEARCH_PILL_CENTER_DIP - SEARCH_PILL_HALF_W_DIP, SEARCH_PILL_TOP_DIP,
-        SEARCH_PILL_CENTER_DIP + SEARCH_PILL_HALF_W_DIP, SEARCH_PILL_BOTTOM_DIP);
+    // 用实时客户区宽度，保证窗口缩放后胶囊仍然水平居中（widthDip_ 可能还没在 Paint 里更新）
+    float width = hwnd_ ? ClientWidthDip(hwnd_, dpi_) : 840.0f;
+    float cx = width * 0.5f;
+    return D2D1::RectF(cx - SEARCH_PILL_HALF_W_DIP, SEARCH_PILL_TOP_DIP,
+        cx + SEARCH_PILL_HALF_W_DIP, SEARCH_PILL_BOTTOM_DIP);
 }
 
 D2D1_RECT_F LauncherApp::SearchTextRect() const
 {
-    // 文字区 = 胶囊内缩一圈；文字在其中水平居中
+    // 文字区：放大镜右侧起、到胶囊右边内缩；文字左对齐，光标停在最左
     D2D1_RECT_F pill = SearchPillRect();
-    return D2D1::RectF(pill.left + 16.0f, pill.top + 2.0f, pill.right - 16.0f, pill.bottom - 2.0f);
+    return D2D1::RectF(pill.left + SEARCH_TEXT_LEFT_INSET_DIP, pill.top + 2.0f,
+        pill.right - SEARCH_TEXT_RIGHT_INSET_DIP, pill.bottom - 2.0f);
 }
 
 void LauncherApp::DrawPill()

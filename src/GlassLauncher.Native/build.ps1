@@ -37,17 +37,17 @@ if (Test-Path $icon) {
 1 ICON "$iconRc"
 
 1 VERSIONINFO
-FILEVERSION 1,0,2,0
-PRODUCTVERSION 1,0,2,0
+FILEVERSION 1,0,3,0
+PRODUCTVERSION 1,0,3,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "GlassLauncher Native"
-      VALUE "FileVersion", "1.0.2"
+      VALUE "FileVersion", "1.0.3"
       VALUE "ProductName", "GlassLauncher"
-      VALUE "ProductVersion", "1.0.2"
+      VALUE "ProductVersion", "1.0.3"
       VALUE "CompanyName", "aminoc4"
       VALUE "OriginalFilename", "GlassLauncherNative.exe"
     END
