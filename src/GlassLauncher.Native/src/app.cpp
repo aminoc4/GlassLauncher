@@ -40,6 +40,10 @@ constexpr float ItemH = 122.0f;
 constexpr float ItemStride = 120.0f;
 constexpr float GridLeft = 32.0f;
 constexpr float GridTopDip = 92.0f;
+// 搜索胶囊是固定宽度、居中于主窗口启动尺寸（840 DIP），不随缩放漂移：
+// 之前用 widthDip_ * 0.5（客户区宽度）做中心，而布局在 WM_SIZE 时按显示前的小客户区算过，
+// 两者不同步就会出现"可编辑区与可见胶囊错位"。
+constexpr float SEARCH_PILL_CENTER_DIP = 420.0f;
 
 float ClientWidthDip(HWND hwnd, float dpi)
 {
@@ -260,6 +264,8 @@ void LauncherApp::CreateSearchEdit()
 {
     if (GetEnvironmentVariableW(L"GL_NATIVE_NO_SEARCH_EDIT", nullptr, 0) > 0) return;
 
+    // 透明、无边框的"看不见的输入框"：文字与光标由 DrawSearchBar 用 D2D 画，
+    // 这个 EDIT 只负责键盘输入、光标位置和选区，所以不能自己画任何东西。
     searchEdit_ = CreateWindowExW(0, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
         0, 0, 10, 10, hwnd_, (HMENU)1001, instance_, nullptr);
@@ -283,16 +289,50 @@ void LauncherApp::ApplySearchFont()
         DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
     SendMessageW(searchEdit_, WM_SETFONT, (WPARAM)searchFont_, TRUE);
+
+    // EDIT 的高度＝字体高度 + 编辑框内边距；宽度也必须跟着字体/DPI 走。
+    // 之前硬编码 185×24 再被 "×5 倍文本宽" 放大，DPI 一变就会伸到胶囊外，
+    // 右对齐的文字随之跑到错位置——这就是"搜索框和 UI 不同步"的根因。
+    HDC dc = GetDC(searchEdit_);
+    HGDIOBJ old = SelectObject(dc, searchFont_);
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(dc, &tm);
+    if (old) SelectObject(dc, old);
+    ReleaseDC(searchEdit_, dc);
+
+    // EM_SETRECT 只影响文本区不走捷径；高度用字体 + 上下各 2px 内边距
+    int pad = (int)(2 * dpi_);
+    RECT textRect = { (int)(2 * dpi_), pad, (int)(2 * dpi_) + (int)(160 * dpi_), tm.tmHeight + pad };
+    SendMessageW(searchEdit_, EM_SETRECTNP, 0, (LPARAM)&textRect);
 }
 
 void LauncherApp::LayoutChildren()
 {
     if (!searchEdit_) return;
-    float cx = widthDip_ * 0.5f;
+
+    // 输入框锚定在自绘胶囊的"文本区"上（同一个几何函数），不再各算各的。
+    // 注意单位：GetClientRect / SetWindowPos 用物理像素，DIP 几何必须乘 dpi_。
+    D2D1_RECT_F text = SearchTextRect();
+
+    // 尺寸只用 DIP 常量，不读 DPI 相关度量（字体/度量在启动早期可能还是 96dpi 值）。
+    int heightDip = 26;
+    int topDip = (int)text.top + ((int)(text.bottom - text.top) - heightDip) / 2;
+    int widthDip = 110; // 仅用于接收键盘输入，文字与光标由 D2D 绘制
+
+    Log("search edit layout x=%d y=%d w=%d h=%d (dpi=%.2f widthDip=%.1f textL=%.1f)", (int)text.left, topDip, widthDip, heightDip, dpi_, widthDip_, text.left);
+
+
     SetWindowPos(searchEdit_, nullptr,
-        (int)((cx - 93.0f) * dpi_), (int)(9.0f * dpi_),
-        (int)(185.0f * dpi_), (int)(24.0f * dpi_),
+        (int)(text.left * dpi_ + 0.5f), (int)(topDip * dpi_ + 0.5f),
+        (int)(widthDip * dpi_ + 0.5f), (int)(heightDip * dpi_ + 0.5f),
         SWP_NOZORDER | SWP_NOACTIVATE);
+
+    // 光标位置：EDIT 内部用像素，这里换算成相对文本区左边界（DIP）
+    DWORD sel = (DWORD)SendMessageW(searchEdit_, EM_GETSEL, 0, 0);
+    POINT caret = {0, 0};
+    SendMessageW(searchEdit_, EM_POSFROMCHAR, (WPARAM)&caret, (LPARAM)LOWORD(sel));
+    caretX_ = (int)(caret.x / dpi_);
+    caretH_ = 17;
 }
 
 void LauncherApp::OnSearchChanged()
@@ -300,7 +340,8 @@ void LauncherApp::OnSearchChanged()
     if (!searchEdit_) return;
     wchar_t buf[256] = {};
     GetWindowTextW(searchEdit_, buf, 256);
-    filter_ = buf;
+    searchText_ = buf;
+    filter_ = searchText_;
     RebuildVisible();
     scroll_ = 0.0f;
     hover_ = -1;
@@ -340,6 +381,20 @@ LRESULT CALLBACK LauncherApp::SearchEditProc(HWND hwnd, UINT msg, WPARAM w, LPAR
     else if (msg == WM_CHAR && w == 0x1B)
     {
         return 0; // 吃掉 Esc 的提示音
+    }
+    else if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
+    {
+        self->searchFocused_ = msg == WM_SETFOCUS;
+        self->ScheduleRepaint();
+    }
+    else if (msg == WM_KEYUP || msg == WM_LBUTTONUP || msg == WM_KEYDOWN)
+    {
+        // 光标位置变了：更新插入符后重绘（Esc/Enter 已在上方返回）
+        LRESULT result = CallWindowProcW(self->searchEditProc_ ? self->searchEditProc_ : DefWindowProcW,
+            hwnd, msg, w, l);
+        self->LayoutChildren();
+        self->ScheduleRepaint();
+        return result;
     }
 
     return CallWindowProcW(self->searchEditProc_ ? self->searchEditProc_ : DefWindowProcW, hwnd, msg, w, l);
@@ -986,8 +1041,7 @@ void LauncherApp::DrawChrome() {}
 
 void LauncherApp::DrawSearchBar()
 {
-    float cx = widthDip_ * 0.5f;
-    D2D1_RECT_F pill = D2D1::RectF(cx - 130.0f, 7.0f, cx + 130.0f, 37.0f);
+    D2D1_RECT_F pill = SearchPillRect();
 
     // 与子窗口 EDIT 的背景刷同色（EDIT 是实心窗口，胶囊必须跟它一致才看不出接缝）
     D2D1_COLOR_F bg = dark_
@@ -995,8 +1049,36 @@ void LauncherApp::DrawSearchBar()
         : D2D1::ColorF(0xE6 / 255.0f, 0xE8 / 255.0f, 0xED / 255.0f);
     renderer_.FillRoundRect(pill, 15.0f, bg);
     renderer_.StrokeRoundRect(pill, 15.0f, colors_.searchBorder, 1.0f);
-    renderer_.DrawText(L"\uE721", D2D1::RectF(cx - 118.0f, 7.0f, cx - 98.0f, 37.0f),
-        renderer_.GlyphFormat(), colors_.searchGlyph);
+
+    // 放大镜：固定在胶囊左侧
+    renderer_.DrawText(L"\uE721", D2D1::RectF(pill.left + 12.0f, pill.top,
+        pill.left + 32.0f, pill.bottom), renderer_.GlyphFormat(), colors_.searchGlyph);
+
+    // 搜索文字与光标由这里绘制（真 EDIT 只用于输入，见 LayoutChildren）
+    D2D1_RECT_F text = SearchTextRect();
+    D2D1_COLOR_F textColor = dark_ ? D2D1::ColorF(0xF2 / 255.0f, 0xF2 / 255.0f, 0xF7 / 255.0f)
+                                   : D2D1::ColorF(0x1C / 255.0f, 0x1C / 255.0f, 0x1E / 255.0f);
+
+    if (searchText_.empty())
+    {
+        if (!searchFocused_)
+        {
+            renderer_.DrawText(L"搜索", text, renderer_.NameFormat(), textColor);
+        }
+    }
+    else
+    {
+        renderer_.DrawText(searchText_, text, renderer_.NameFormat(), textColor, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    }
+
+    if (searchFocused_)
+    {
+        float cx = text.left + (float)caretX_;
+        if (cx > text.right) cx = text.right;
+        float h = caretH_ > 0 ? (float)caretH_ : 15.0f;
+        float top = (text.top + text.bottom) * 0.5f - h * 0.5f;
+        renderer_.FillRect(D2D1::RectF(cx, top, cx + 1.0f, top + h), textColor);
+    }
 
     // 右上角齿轮（设置入口），与 WPF 版同位置
     D2D1_POINT_2F gearCenter = D2D1::Point2F(widthDip_ - 33.0f, 22.0f);
@@ -1004,6 +1086,19 @@ void LauncherApp::DrawSearchBar()
         gearCenter.x + 13.0f, gearCenter.y + 13.0f), 13.0f, colors_.searchBorder, 1.2f);
     renderer_.DrawTextCentered(L"\uE713", D2D1::RectF(gearCenter.x - 13.0f, gearCenter.y - 13.0f,
         gearCenter.x + 13.0f, gearCenter.y + 13.0f), renderer_.GlyphFormat(), colors_.searchGlyph);
+}
+
+D2D1_RECT_F LauncherApp::SearchPillRect() const
+{
+    return D2D1::RectF(SEARCH_PILL_CENTER_DIP - 130.0f, 7.0f,
+        SEARCH_PILL_CENTER_DIP + 130.0f, 37.0f);
+}
+
+D2D1_RECT_F LauncherApp::SearchTextRect() const
+{
+    // 胶囊内、放大镜右侧；左侧留出放大镜，右侧留 12 的内边距
+    D2D1_RECT_F pill = SearchPillRect();
+    return D2D1::RectF(pill.left + 34.0f, pill.top + 2.0f, pill.right - 12.0f, pill.bottom - 2.0f);
 }
 
 void LauncherApp::DrawPill()
@@ -2165,6 +2260,7 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 
         case WM_CTLCOLOREDIT:
         {
+            // 让 EDIT 完全透明：背景并入胶囊色，文字色与胶囊内文字一致
             HDC dc = reinterpret_cast<HDC>(w);
             SetTextColor(dc, dark_ ? RGB(0xF2, 0xF2, 0xF7) : RGB(0x1C, 0x1C, 0x1E));
             SetBkColor(dc, dark_ ? RGB(0x2A, 0x2B, 0x31) : RGB(0xE6, 0xE8, 0xED));

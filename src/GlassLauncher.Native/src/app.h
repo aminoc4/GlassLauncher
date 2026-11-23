@@ -43,6 +43,12 @@ private:
     HWND searchEdit_ = nullptr;
     HFONT searchFont_ = nullptr;
     HBRUSH searchBackBrush_ = nullptr;
+    // 搜索胶囊是自绘的：真输入框退化成"无边框透明编辑框"，只负责输入/光标/选区，
+    // 位置与尺寸全部由 SearchPillRect/SearchTextRect 推导，保证与 UI 强绑定。
+    std::wstring searchText_;
+    bool searchFocused_ = false;
+    int caretX_ = -1;      // 插入符在文本矩形内的 DIP 偏移
+    int caretH_ = 0;
     WNDPROC searchEditProc_ = nullptr;
 
     // ── 交互状态 ──
@@ -125,6 +131,8 @@ private:
     void DrawBackdrop();
     void DrawChrome();
     void DrawSearchBar();
+    D2D1_RECT_F SearchPillRect() const;
+    D2D1_RECT_F SearchTextRect() const;
     void DrawPill();
     void DrawItems();
     void DrawItemTile(int entry, float x, float y, bool hover, float alpha);
