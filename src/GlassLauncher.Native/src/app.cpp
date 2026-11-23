@@ -640,6 +640,14 @@ int LauncherApp::Run(HINSTANCE instance)
         StartFade(false);
     }
 
+    {
+        wchar_t snapMode[32] = {};
+        if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_SNAP", snapMode, 32) > 0)
+        {
+            SetTimer(hwnd_, 9, 900, nullptr);
+        }
+    }
+
     InitTray();
     ApplyHotkey();
     ApplyTopmost();
@@ -759,12 +767,16 @@ bool LauncherApp::CreateMainWindow()
         SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
     }
 
-    int pref = 2; // DWMWCP_ROUND
-    DwmSetWindowAttribute(hwnd_, 33, &pref, sizeof(pref));
+    if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_NO_DWM33", nullptr, 0) == 0)
+    {
+        int pref = 2; // DWMWCP_ROUND
+        DwmSetWindowAttribute(hwnd_, 33, &pref, sizeof(pref));
+    }
 
     // Win11 会给带边框的窗口画一圈 1px 的系统边框（浅色模式下是白线），
     // 我们的客户区铺满整窗，这圈线正好落在画面上、沿窗口轮廓连成一圈 ——
     // 用户反馈的"靠近边缘的白线"就是它。DWMWA_COLOR_NONE 关掉。
+    if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_NO_DWM34", nullptr, 0) == 0)
     {
         DWORD noBorder = 0xFFFFFFFE; // DWMWA_COLOR_NONE
         DwmSetWindowAttribute(hwnd_, 34 /* DWMWA_BORDER_COLOR */, &noBorder, sizeof(noBorder));
@@ -1256,6 +1268,7 @@ void LauncherApp::OnLiveCaptureReady()
 void LauncherApp::UpdateWindowRegion()
 {
     if (!hwnd_) return;
+    if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_NO_REGION", nullptr, 0) > 0) return;
     RECT rc = {};
     GetClientRect(hwnd_, &rc);
     if (rc.right <= 0 || rc.bottom <= 0) return;
@@ -1434,6 +1447,46 @@ void LauncherApp::MaybeSubmitLiveFrame()
     }
 }
 
+bool LauncherApp::ApplySnapOnDrop()
+{
+    if (GetEnvironmentVariableW(L"GL_NATIVE_NO_SNAP", nullptr, 0) > 0) return false;
+
+    POINT pt = {};
+    GetCursorPos(&pt);
+
+    HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return false;
+
+    RECT work = info.rcWork;
+    int threshold = (int)(10.0f * dpi_);
+    int width = work.right - work.left;
+    int height = work.bottom - work.top;
+
+    if (pt.y <= work.top + threshold)
+    {
+        if (!IsZoomed(hwnd_)) ShowWindow(hwnd_, SW_MAXIMIZE);
+        Log("snap maximize");
+        return true;
+    }
+    if (pt.x <= work.left + threshold)
+    {
+        SetWindowPos(hwnd_, HWND_TOP, work.left, work.top, width / 2, height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        Log("snap left %dx%d", width / 2, height);
+        return true;
+    }
+    if (pt.x >= work.right - threshold)
+    {
+        SetWindowPos(hwnd_, HWND_TOP, work.left + width / 2, work.top, width / 2, height,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        Log("snap right %dx%d", width / 2, height);
+        return true;
+    }
+    return false;
+}
+
 void LauncherApp::TickWindowDrag()
 {
     if (!windowDrag_) return;
@@ -1573,7 +1626,8 @@ void LauncherApp::StopWindowDrag()
         liveFrames_ > 0 ? liveUploadMs_ / liveFrames_ : 0.0,
         backdrop_.LastBltMs(), backdrop_.LastBlurMs());
     liveCapture_.DropReady();
-    RebuildBackdrop();
+    bool snapped = ApplySnapOnDrop();
+    if (!snapped) RebuildBackdrop();
     ScheduleRepaint();
 
     if (autoDrag_)
@@ -1728,7 +1782,10 @@ void LauncherApp::ShowLauncher()
     }
 
     SetForegroundWindow(hwnd_);
-    if (searchEdit_) SetFocus(searchEdit_);
+    if (searchEdit_ && GetEnvironmentVariableW(L"GL_NATIVE_NO_SHOW_FOCUS", nullptr, 0) == 0)
+    {
+        SetFocus(searchEdit_);
+    }
     ScheduleRepaint();
 
     if (layered_)
@@ -2156,6 +2213,27 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
             if (w == 7) // TIMER_FADE
             {
                 TickFade();
+                return 0;
+            }
+            if (w == 9) // TIMER_SNAP_TEST（测试用：把光标放到边缘再走一次吸附判断）
+            {
+                KillTimer(hwnd, 9);
+                wchar_t mode[32] = {};
+                if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_SNAP", mode, 32) > 0)
+                {
+                    HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+                    MONITORINFO info = {};
+                    info.cbSize = sizeof(info);
+                    if (GetMonitorInfoW(monitor, &info))
+                    {
+                        RECT work = info.rcWork;
+                        if (wcscmp(mode, L"left") == 0) SetCursorPos(work.left + 2, work.top + 200);
+                        else if (wcscmp(mode, L"right") == 0) SetCursorPos(work.right - 2, work.top + 200);
+                        else SetCursorPos(work.left + 400, work.top + 2);
+                        Log("snap test %ls", mode);
+                        ApplySnapOnDrop();
+                    }
+                }
                 return 0;
             }
             if (w == 4) // TIMER_AUTO_EXIT（测试用）

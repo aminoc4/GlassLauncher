@@ -163,6 +163,7 @@ private:
     void OnSearchChanged();
     void StartWindowDrag();
     void StopWindowDrag();
+    bool ApplySnapOnDrop();
     void TickWindowDrag();
     void StartWindowResize(int hit);
     void StopWindowResize();
