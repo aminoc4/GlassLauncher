@@ -40,10 +40,12 @@ constexpr float ItemH = 122.0f;
 constexpr float ItemStride = 120.0f;
 constexpr float GridLeft = 32.0f;
 constexpr float GridTopDip = 92.0f;
-// 搜索胶囊是固定宽度、居中于主窗口启动尺寸（840 DIP），不随缩放漂移：
-// 之前用 widthDip_ * 0.5（客户区宽度）做中心，而布局在 WM_SIZE 时按显示前的小客户区算过，
-// 两者不同步就会出现"可编辑区与可见胶囊错位"。
+// 搜索胶囊：固定尺寸、居中于主窗口启动宽度（840 DIP）。胶囊整体就是一个可点击的输入区，
+// 文字在其中水平居中（空态显示占位提示 + 居中光标），不再单独摆一个左侧放大镜。
 constexpr float SEARCH_PILL_CENTER_DIP = 420.0f;
+constexpr float SEARCH_PILL_HALF_W_DIP = 190.0f;
+constexpr float SEARCH_PILL_TOP_DIP = 8.0f;
+constexpr float SEARCH_PILL_BOTTOM_DIP = 38.0f;
 
 float ClientWidthDip(HWND hwnd, float dpi)
 {
@@ -289,50 +291,66 @@ void LauncherApp::ApplySearchFont()
         DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
         DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
     SendMessageW(searchEdit_, WM_SETFONT, (WPARAM)searchFont_, TRUE);
-
-    // EDIT 的高度＝字体高度 + 编辑框内边距；宽度也必须跟着字体/DPI 走。
-    // 之前硬编码 185×24 再被 "×5 倍文本宽" 放大，DPI 一变就会伸到胶囊外，
-    // 右对齐的文字随之跑到错位置——这就是"搜索框和 UI 不同步"的根因。
-    HDC dc = GetDC(searchEdit_);
-    HGDIOBJ old = SelectObject(dc, searchFont_);
-    TEXTMETRICW tm = {};
-    GetTextMetricsW(dc, &tm);
-    if (old) SelectObject(dc, old);
-    ReleaseDC(searchEdit_, dc);
-
-    // EM_SETRECT 只影响文本区不走捷径；高度用字体 + 上下各 2px 内边距
-    int pad = (int)(2 * dpi_);
-    RECT textRect = { (int)(2 * dpi_), pad, (int)(2 * dpi_) + (int)(160 * dpi_), tm.tmHeight + pad };
-    SendMessageW(searchEdit_, EM_SETRECTNP, 0, (LPARAM)&textRect);
 }
 
 void LauncherApp::LayoutChildren()
 {
     if (!searchEdit_) return;
 
-    // 输入框锚定在自绘胶囊的"文本区"上（同一个几何函数），不再各算各的。
-    // 注意单位：GetClientRect / SetWindowPos 用物理像素，DIP 几何必须乘 dpi_。
+    // EDIT 是"可见文字的唯一来源"（保证 ClearType/IME/光标都是系统实现），
+    // 宽度跟着文本长度走、整体在胶囊里水平居中：点胶囊任意位置聚焦，
+    // 空态光标/占位提示自然落在正中。
+    D2D1_RECT_F pill = SearchPillRect();
     D2D1_RECT_F text = SearchTextRect();
 
-    // 尺寸只用 DIP 常量，不读 DPI 相关度量（字体/度量在启动早期可能还是 96dpi 值）。
-    int heightDip = 26;
-    int topDip = (int)text.top + ((int)(text.bottom - text.top) - heightDip) / 2;
-    int widthDip = 110; // 仅用于接收键盘输入，文字与光标由 D2D 绘制
+    int textPx = 0;
+    int linePx = (int)(18 * dpi_);
+    HDC dc = GetDC(searchEdit_);
+    HGDIOBJ old = searchFont_ ? SelectObject(dc, searchFont_) : nullptr;
+    TEXTMETRICW tm = {};
+    GetTextMetricsW(dc, &tm);
+    if (tm.tmHeight > 0) linePx = tm.tmHeight;
+    if (!searchText_.empty())
+    {
+        SIZE extent = {};
+        GetTextExtentPoint32W(dc, searchText_.c_str(), (int)searchText_.size(), &extent);
+        textPx = extent.cx;
+    }
+    else
+    {
+        SIZE extent = {};
+        const wchar_t* cue = L"搜索";
+        GetTextExtentPoint32W(dc, cue, 2, &extent);
+        textPx = extent.cx;
+    }
+    if (old) SelectObject(dc, old);
+    ReleaseDC(searchEdit_, dc);
 
-    Log("search edit layout x=%d y=%d w=%d h=%d (dpi=%.2f widthDip=%.1f textL=%.1f)", (int)text.left, topDip, widthDip, heightDip, dpi_, widthDip_, text.left);
+    int textAreaWidthDip = (int)(text.right - text.left);
+    int widthDip = 0;
+    if (searchText_.empty())
+    {
+        // 空态：聚焦时把 EDIT 收窄到光标附近，插入符正好落在胶囊正中；
+        // 未聚焦时留出占位提示的宽度。
+        widthDip = searchFocused_ ? 8 : 72;
+    }
+    else
+    {
+        widthDip = std::min(textAreaWidthDip, (int)(textPx / dpi_) + 18);
+        widthDip = std::max(widthDip, 40);
+    }
+    int xDip = (int)((text.left + text.right) * 0.5f) - widthDip / 2;
+    int heightPx = linePx + (int)(4 * dpi_);
 
+    // 垂直居中：EDIT 内部文字是从顶部往下排的，所以 EDIT 必须贴合"字体行高 + 少量内边距"，
+    // 再把整个 EDIT 摆到胶囊的垂直中心——之前 EDIT 高 26 DIP、字体只有 ~16 DIP，
+    // 文字就贴在胶囊上半部（用户看到的"上下不居中"）。
+    int yPx = (int)(((pill.top + pill.bottom) * 0.5f * dpi_) - heightPx * 0.5f + 0.5f);
 
     SetWindowPos(searchEdit_, nullptr,
-        (int)(text.left * dpi_ + 0.5f), (int)(topDip * dpi_ + 0.5f),
-        (int)(widthDip * dpi_ + 0.5f), (int)(heightDip * dpi_ + 0.5f),
+        (int)(xDip * dpi_ + 0.5f), yPx,
+        (int)(widthDip * dpi_ + 0.5f), heightPx,
         SWP_NOZORDER | SWP_NOACTIVATE);
-
-    // 光标位置：EDIT 内部用像素，这里换算成相对文本区左边界（DIP）
-    DWORD sel = (DWORD)SendMessageW(searchEdit_, EM_GETSEL, 0, 0);
-    POINT caret = {0, 0};
-    SendMessageW(searchEdit_, EM_POSFROMCHAR, (WPARAM)&caret, (LPARAM)LOWORD(sel));
-    caretX_ = (int)(caret.x / dpi_);
-    caretH_ = 17;
 }
 
 void LauncherApp::OnSearchChanged()
@@ -385,6 +403,7 @@ LRESULT CALLBACK LauncherApp::SearchEditProc(HWND hwnd, UINT msg, WPARAM w, LPAR
     else if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS)
     {
         self->searchFocused_ = msg == WM_SETFOCUS;
+        self->LayoutChildren();
         self->ScheduleRepaint();
     }
     else if (msg == WM_KEYUP || msg == WM_LBUTTONUP || msg == WM_KEYDOWN)
@@ -700,6 +719,15 @@ int LauncherApp::Run(HINSTANCE instance)
         if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_SNAP", snapMode, 32) > 0)
         {
             SetTimer(hwnd_, 9, 900, nullptr);
+        }
+    }
+
+    {
+        // 测试钩子：启动后直接填入搜索词，方便截图验证居中/过滤
+        wchar_t query[128] = {};
+        if (GetEnvironmentVariableW(L"GL_NATIVE_TEST_QUERY", query, 128) > 0 && searchEdit_)
+        {
+            SetWindowTextW(searchEdit_, query);
         }
     }
 
@@ -1043,42 +1071,16 @@ void LauncherApp::DrawSearchBar()
 {
     D2D1_RECT_F pill = SearchPillRect();
 
-    // 与子窗口 EDIT 的背景刷同色（EDIT 是实心窗口，胶囊必须跟它一致才看不出接缝）
-    D2D1_COLOR_F bg = dark_
-        ? D2D1::ColorF(0x2A / 255.0f, 0x2B / 255.0f, 0x31 / 255.0f)
-        : D2D1::ColorF(0xE6 / 255.0f, 0xE8 / 255.0f, 0xED / 255.0f);
-    renderer_.FillRoundRect(pill, 15.0f, bg);
+    // 胶囊底色用主题的 searchSurface（半透明，EDIT 透出这层）
+    renderer_.FillRoundRect(pill, 15.0f, colors_.searchSurface);
     renderer_.StrokeRoundRect(pill, 15.0f, colors_.searchBorder, 1.0f);
 
-    // 放大镜：固定在胶囊左侧
-    renderer_.DrawText(L"\uE721", D2D1::RectF(pill.left + 12.0f, pill.top,
-        pill.left + 32.0f, pill.bottom), renderer_.GlyphFormat(), colors_.searchGlyph);
+    // 左侧放大镜（纯装饰，不参与文字居中）
+    renderer_.DrawText(L"\uE721", D2D1::RectF(pill.left + 14.0f, pill.top,
+        pill.left + 34.0f, pill.bottom), renderer_.GlyphFormat(), colors_.searchGlyph);
 
-    // 搜索文字与光标由这里绘制（真 EDIT 只用于输入，见 LayoutChildren）
-    D2D1_RECT_F text = SearchTextRect();
-    D2D1_COLOR_F textColor = dark_ ? D2D1::ColorF(0xF2 / 255.0f, 0xF2 / 255.0f, 0xF7 / 255.0f)
-                                   : D2D1::ColorF(0x1C / 255.0f, 0x1C / 255.0f, 0x1E / 255.0f);
-
-    if (searchText_.empty())
-    {
-        if (!searchFocused_)
-        {
-            renderer_.DrawText(L"搜索", text, renderer_.NameFormat(), textColor);
-        }
-    }
-    else
-    {
-        renderer_.DrawText(searchText_, text, renderer_.NameFormat(), textColor, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-    }
-
-    if (searchFocused_)
-    {
-        float cx = text.left + (float)caretX_;
-        if (cx > text.right) cx = text.right;
-        float h = caretH_ > 0 ? (float)caretH_ : 15.0f;
-        float top = (text.top + text.bottom) * 0.5f - h * 0.5f;
-        renderer_.FillRect(D2D1::RectF(cx, top, cx + 1.0f, top + h), textColor);
-    }
+    // 文字/占位/光标全部由 EDIT 自己画（见 LayoutChildren）：
+    // 这样 ClearType、IME 组合、选区都是系统实现，且不会和 D2D 文字重叠。
 
     // 右上角齿轮（设置入口），与 WPF 版同位置
     D2D1_POINT_2F gearCenter = D2D1::Point2F(widthDip_ - 33.0f, 22.0f);
@@ -1090,15 +1092,15 @@ void LauncherApp::DrawSearchBar()
 
 D2D1_RECT_F LauncherApp::SearchPillRect() const
 {
-    return D2D1::RectF(SEARCH_PILL_CENTER_DIP - 130.0f, 7.0f,
-        SEARCH_PILL_CENTER_DIP + 130.0f, 37.0f);
+    return D2D1::RectF(SEARCH_PILL_CENTER_DIP - SEARCH_PILL_HALF_W_DIP, SEARCH_PILL_TOP_DIP,
+        SEARCH_PILL_CENTER_DIP + SEARCH_PILL_HALF_W_DIP, SEARCH_PILL_BOTTOM_DIP);
 }
 
 D2D1_RECT_F LauncherApp::SearchTextRect() const
 {
-    // 胶囊内、放大镜右侧；左侧留出放大镜，右侧留 12 的内边距
+    // 文字区 = 胶囊内缩一圈；文字在其中水平居中
     D2D1_RECT_F pill = SearchPillRect();
-    return D2D1::RectF(pill.left + 34.0f, pill.top + 2.0f, pill.right - 12.0f, pill.bottom - 2.0f);
+    return D2D1::RectF(pill.left + 16.0f, pill.top + 2.0f, pill.right - 16.0f, pill.bottom - 2.0f);
 }
 
 void LauncherApp::DrawPill()
@@ -1467,6 +1469,20 @@ void LauncherApp::OnLeftDown(POINT clientDip)
     {
         ShowSettings();
         return;
+    }
+
+    // 整个搜索胶囊都是输入区：点胶囊任意位置（包括自绘的留白区域）都聚焦到隐藏的 EDIT。
+    {
+        D2D1_RECT_F pill = SearchPillRect();
+        if (x >= pill.left && x <= pill.right && y >= pill.top && y <= pill.bottom)
+        {
+            if (searchEdit_)
+            {
+                SetFocus(searchEdit_);
+                SendMessageW(searchEdit_, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+            }
+            return;
+        }
     }
 
     if (y < TitleDip)
@@ -2260,11 +2276,11 @@ LRESULT LauncherApp::WndProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l)
 
         case WM_CTLCOLOREDIT:
         {
-            // 让 EDIT 完全透明：背景并入胶囊色，文字色与胶囊内文字一致
+            // EDIT 只画文字/光标，背景透明露出胶囊：HOLLOW_BRUSH + TRANSPARENT。
             HDC dc = reinterpret_cast<HDC>(w);
             SetTextColor(dc, dark_ ? RGB(0xF2, 0xF2, 0xF7) : RGB(0x1C, 0x1C, 0x1E));
-            SetBkColor(dc, dark_ ? RGB(0x2A, 0x2B, 0x31) : RGB(0xE6, 0xE8, 0xED));
-            return reinterpret_cast<LRESULT>(searchBackBrush_);
+            SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(GetStockObject(HOLLOW_BRUSH));
         }
 
         case WM_MOUSEWHEEL:

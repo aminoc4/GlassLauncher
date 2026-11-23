@@ -47,8 +47,6 @@ private:
     // 位置与尺寸全部由 SearchPillRect/SearchTextRect 推导，保证与 UI 强绑定。
     std::wstring searchText_;
     bool searchFocused_ = false;
-    int caretX_ = -1;      // 插入符在文本矩形内的 DIP 偏移
-    int caretH_ = 0;
     WNDPROC searchEditProc_ = nullptr;
 
     // ── 交互状态 ──
